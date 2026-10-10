@@ -13,9 +13,7 @@ int bgx_test_fault(const char *point) {
     return fault && !strcmp(fault, point);
 }
 
-void bgx_test_child(pid_t pid) {
-    const char *file = getenv("BGX_TEST_CHILD_NOTIFY");
-    if (!file) return;
+static void notify_pid(const char *file, pid_t pid) {
     int fd = open(file, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
     if (fd < 0) _exit(126);
     char data[64];
@@ -25,18 +23,17 @@ void bgx_test_child(pid_t pid) {
     close(fd);
 }
 
+void bgx_test_child(pid_t pid) {
+    const char *file = getenv("BGX_TEST_CHILD_NOTIFY");
+    if (file) notify_pid(file, pid);
+}
+
 void bgx_test_point(const char *point) {
     const char *selected = getenv("BGX_TEST_POINT");
     if (!selected || strcmp(selected, point)) return;
     const char *file = getenv("BGX_TEST_NOTIFY");
     if (!file) _exit(126);
-    int fd = open(file, O_CREAT | O_EXCL | O_WRONLY | O_CLOEXEC, 0600);
-    if (fd < 0) _exit(126);
-    char data[64];
-    int length = snprintf(data, sizeof(data), "%ld\n", (long)getpid());
-    Error err = {0};
-    if (write_all(fd, data, (size_t)length, &err)) _exit(126);
-    close(fd);
+    notify_pid(file, getpid());
     if (bgx_test_fault("delay_before_stop")) {
         struct timespec delay = {.tv_nsec = 100000000};
         while (nanosleep(&delay, &delay) && errno == EINTR) {}

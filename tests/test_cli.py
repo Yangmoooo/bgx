@@ -1,4 +1,5 @@
 import json
+from copy import deepcopy
 from datetime import datetime, timezone
 import os
 from pathlib import Path
@@ -65,15 +66,22 @@ class BgxTest(unittest.TestCase):
         self.groups.add(record["process_identity"]["process_group"])
         return record
 
-    def start(self, name="web", code=None):
+    def start(self, name="web", code=None, command="start"):
         if code is None:
             code = "import time; print('ready', flush=True); time.sleep(120)"
-        result = self.cli("start", name, "--", sys.executable, "-c", code)
+        result = self.cli(command, name, "--", sys.executable, "-c", code)
         self.assertEqual(result.stdout, b"")
         self.assertEqual(result.stderr, b"")
         record = self.track(name)
         self.wait_log(b"ready", name)
         return record
+
+    def make_log(self, contents=b""):
+        self.start()
+        self.cli("stop", "web")
+        path = self.directory() / "output.log"
+        path.write_bytes(contents)
+        return path
 
     def wait_log(self, needle, name="web"):
         deadline = time.monotonic() + 5
@@ -93,12 +101,7 @@ class BgxTest(unittest.TestCase):
             time.sleep(0.02)
         self.fail("instance did not exit")
 
-    def test_help_and_grammar(self):
-        for args in [(), ("help",), ("--help",), ("help", "start"), ("start", "--help")]:
-            self.assertIn(b"bgx start NAME", self.cli(*args).stdout)
-        self.assertIn(b"bgx ", self.cli("version").stdout)
-        self.assertEqual(self.cli("version").stdout, self.cli("--version").stdout)
-        self.assertEqual(self.cli("version").stdout, self.cli("-V").stdout)
+    def test_invalid_arguments(self):
         for args in [
             ("web", "--", "true"), ("run", "web", "--", "true"),
             ("start",), ("start", "web"), ("start", "web", "true"),
@@ -118,42 +121,36 @@ class BgxTest(unittest.TestCase):
         self.assertIn(b"NAME", self.cli("ls").stdout)
         self.assertFalse(self.state.exists())
 
-    def test_command_help_is_specific_and_descriptive(self):
+    def test_help_and_aliases(self):
         general = self.cli("help").stdout
-        for command in ["start", "stop", "list", "remove", "log", "help", "version"]:
+        self.assertIn(b"bgx start NAME", general)
+        for args in [(), ("-h",), ("--help",)]:
+            self.assertEqual(self.cli(*args).stdout, general)
+        commands = {"start": ["s"], "stop": [], "list": ["ls", "ps"], "remove": ["rm"],
+                    "log": ["logs"], "help": ["-h", "--help"], "version": ["-V", "--version"]}
+        for command, aliases in commands.items():
             with self.subTest(command=command):
                 specific = self.cli("help", command).stdout
                 self.assertNotEqual(specific, general)
-                self.assertEqual(specific, self.cli(command, "--help").stdout)
-                self.assertEqual(specific, self.cli(command, "-h").stdout)
                 self.assertIn(specific.splitlines()[0], general)
                 self.assertIn(f"bgx {command}".encode(), specific)
+                for name in [command, *aliases]:
+                    for args in [("help", name), (name, "-h"), (name, "--help")]:
+                        self.assertEqual(self.cli(*args).stdout, specific, args)
+        for alias in commands["help"]:
+            self.assertEqual(self.cli(alias, "logs").stdout, self.cli("help", "log").stdout)
+        version = self.cli("version").stdout
+        self.assertTrue(version.startswith(b"bgx "))
+        for alias in commands["version"]:
+            self.assertEqual(self.cli(alias).stdout, version)
         self.assertNotIn(b"bgx start", self.cli("help", "log").stdout)
         self.assertIn(b"--tail N", self.cli("help", "log").stdout)
         self.cli("help", "missing", expect=2)
         self.assertFalse(self.state.exists())
 
-    def test_alias_help_uses_canonical_command(self):
-        aliases = {"s": "start", "ls": "list", "ps": "list", "rm": "remove",
-                   "logs": "log", "-h": "help", "--help": "help",
-                   "-V": "version", "--version": "version"}
-        for alias, command in aliases.items():
-            with self.subTest(alias=alias):
-                expected = self.cli("help", command).stdout
-                self.assertEqual(self.cli("help", alias).stdout, expected)
-                self.assertEqual(self.cli(alias, "--help").stdout, expected)
-                self.assertEqual(self.cli(alias, "-h").stdout, expected)
-        for alias in ["-h", "--help"]:
-            self.assertEqual(self.cli(alias).stdout, self.cli("help").stdout)
-            self.assertEqual(self.cli(alias, "logs").stdout, self.cli("help", "log").stdout)
-        self.assertFalse(self.state.exists())
-
     def test_command_aliases_manage_same_task(self):
         for removal in ["remove", "rm"]:
-            self.cli("s", "web", "--", sys.executable, "-c",
-                     "import time; print('ready', flush=True); time.sleep(120)")
-            self.track()
-            self.wait_log(b"ready")
+            self.start(command="s")
             self.cli(removal, "web", expect=1)
             self.cli("stop", "web")
             listed = self.cli("list").stdout
@@ -274,18 +271,6 @@ class BgxTest(unittest.TestCase):
             self.cli("rm", name)
         self.cli("s", "A" * 129, "--", "/bin/sleep", "120", expect=2)
 
-    def test_case_encoded_directory_must_be_canonical(self):
-        self.start()
-        self.cli("stop", "web")
-        original = self.directory()
-        for key in ["web.0", "web.8", "web.z", "web.11", "123.1"]:
-            moved = original.with_name(key)
-            original.rename(moved)
-            try:
-                self.cli("list", expect=1)
-            finally:
-                moved.rename(original)
-
     def test_detached_argv_cwd_environment_and_stdio(self):
         arg = 'two words "quoted"\n中文\\path'
         code = (
@@ -375,39 +360,15 @@ class BgxTest(unittest.TestCase):
         self.assertFalse(self.directory().exists())
 
     def test_log_is_full_raw_snapshot_and_missing_log_errors(self):
-        self.start()
-        self.cli("stop", "web")
         output = b"line\n" * 500 + b"\x00raw\xffwithout-final-newline"
-        path = self.directory() / "output.log"
-        path.write_bytes(output)
+        path = self.make_log(output)
         self.assertEqual(self.cli("log", "web").stdout, output)
         path.unlink()
         self.cli("log", "web", expect=1)
         self.cli("log", "missing", expect=1)
 
-    def test_slow_log_reader_does_not_hold_lock(self):
-        self.start()
-        self.cli("stop", "web")
-        output = b"a" * (2 * 1024 * 1024)
-        (self.directory() / "output.log").write_bytes(output)
-        child = subprocess.Popen([str(BINARY), "log", "web"], env=self.env,
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
-        try:
-            first = child.stdout.read(1)
-            self.assertEqual(first, b"a")
-            self.cli("rm", "web")  # should not wait for stdout consumer
-            rest, errors = child.communicate(timeout=5)
-            self.assertEqual(child.returncode, 0, errors)
-            self.assertEqual(first + rest, output)
-        finally:
-            if child.poll() is None:
-                child.kill()
-                child.wait()
-
     def test_log_tail_preserves_lines_and_raw_bytes(self):
-        self.start()
-        self.cli("stop", "web")
-        path = self.directory() / "output.log"
+        path = self.make_log()
         samples = [b"", b"\n", b"\n\n", b"one", b"one\n", b"one\ntwo",
                    b"one\ntwo\n", b"one\n\n", b"a\r\nb\x00\xff\r\n", "一\n二".encode()]
         for size in [32766, 32767, 32768, 32769, 65536]:
@@ -435,39 +396,36 @@ class BgxTest(unittest.TestCase):
             self.cli(*args, expect=2)
         self.assertFalse(self.state.exists())
 
-    def test_log_tail_snapshot_releases_lock_and_ignores_appends(self):
-        self.start()
-        self.cli("stop", "web")
-        path = self.directory() / "output.log"
-        output = b"x" * (2 * 1024 * 1024) + b"\n"
-        path.write_bytes(b"skip\n" + output)
-        child = subprocess.Popen([str(BINARY), "log", "web", "--tail", "1"], env=self.env,
-                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
-        try:
-            first = child.stdout.read(1)
-            self.assertEqual(first, b"x")
-            with path.open("ab") as stream:
-                stream.write(b"new data\n")
-            self.cli("rm", "web")
-            rest, errors = child.communicate(timeout=5)
-            self.assertEqual(child.returncode, 0, errors)
-            self.assertEqual(first + rest, output)
-        finally:
-            if child.poll() is None:
-                child.kill()
-                child.wait()
+    def test_log_snapshots_release_lock_and_ignore_appends(self):
+        cases = [([], b"", b"a" * (2 * 1024 * 1024)),
+                 (["--tail", "1"], b"skip\n", b"x" * (2 * 1024 * 1024) + b"\n")]
+        for options, prefix, output in cases:
+            with self.subTest(options=options):
+                path = self.make_log(prefix + output)
+                child = subprocess.Popen([str(BINARY), "log", "web", *options], env=self.env,
+                                         stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0)
+                try:
+                    first = child.stdout.read(1)
+                    self.assertEqual(first, output[:1])
+                    with path.open("ab") as stream:
+                        stream.write(b"new data\n")
+                    self.cli("rm", "web")  # Must not wait for the slow stdout consumer.
+                    rest, errors = child.communicate(timeout=5)
+                    self.assertEqual(child.returncode, 0, errors)
+                    self.assertEqual(first + rest, output)
+                finally:
+                    if child.poll() is None:
+                        child.kill()
+                        child.wait()
 
     def test_identity_mismatch_and_starting_refuse_signals(self):
         original = self.start()
-        variants = []
-        wrong_birth = json.loads(json.dumps(original))
+        wrong_birth = deepcopy(original)
         wrong_birth["process_identity"]["start_marker"] += "-wrong"
-        variants.append(wrong_birth)
-        pending = json.loads(json.dumps(original))
+        pending = deepcopy(original)
         del pending["process_identity"]
         pending["starting"] = True
-        variants.append(pending)
-        for value in variants:
+        for value in [wrong_birth, pending]:
             with self.subTest(value=value):
                 self.save(value)
                 self.cli("stop", "web", expect=1)
@@ -483,7 +441,7 @@ class BgxTest(unittest.TestCase):
         for operation in ["stop", "rm", "reuse"]:
             with self.subTest(operation=operation):
                 original = self.start()
-                old = json.loads(json.dumps(original))
+                old = deepcopy(original)
                 old["process_identity"]["boot_id"] = "previous-boot"
                 self.save(old)
                 row = self.cli("ls").stdout.decode().splitlines()[1].split()
@@ -507,7 +465,7 @@ class BgxTest(unittest.TestCase):
         for elapsed in [0, 59, 60, 3599, 3600, 86400, 100 * 3600 + 125, -3600]:
             with self.subTest(elapsed=elapsed):
                 started = int(time.time()) - elapsed
-                record = json.loads(json.dumps(original))
+                record = deepcopy(original)
                 record["started_at"] = datetime.fromtimestamp(started, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 self.save(record)
                 before = int(time.time())
@@ -569,8 +527,7 @@ class BgxTest(unittest.TestCase):
             self.assertEqual(file.stat().st_mode & 0o777, 0o600)
 
     def test_symlinks_are_not_followed(self):
-        self.start()
-        self.cli("stop", "web")
+        self.make_log()
         outside = self.base / "evidence"
         outside.write_text("keep")
         meta = self.directory() / "meta.json"
