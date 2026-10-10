@@ -121,6 +121,24 @@ class BgxTest(unittest.TestCase):
         self.assertIn(b"NAME", self.cli("ls").stdout)
         self.assertFalse(self.state.exists())
 
+    def test_list_continues_after_invalid_records(self):
+        self.start("aaa")
+        self.start("bbb")
+        self.start("ccc")
+        meta = self.directory("bbb") / "meta.json"
+        for contents in ["{broken", '{"schema_version": 999}']:
+            with self.subTest(contents=contents):
+                meta.write_text(contents)
+                result = self.cli("list", expect=1)
+                rows = [line.split() for line in result.stdout.decode().splitlines()[1:]]
+                self.assertEqual([row[0] for row in rows], ["aaa", "bbb", "ccc"])
+                self.assertEqual(rows[0][1], "running")
+                self.assertEqual(rows[1], ["bbb", "unknown", "-", "-", "-"])
+                self.assertEqual(rows[2][1], "running")
+                self.assertIn(b"bgx: bbb:", result.stderr)
+                self.assertIn(b"invalid", result.stderr)
+                self.assertEqual(meta.read_text(), contents)
+
     def test_help_and_aliases(self):
         general = self.cli("help").stdout
         self.assertIn(b"bgx start NAME", general)
@@ -359,6 +377,90 @@ class BgxTest(unittest.TestCase):
         self.cli("start", "web", "--", str(self.base / "missing"), expect=1)
         self.assertFalse(self.directory().exists())
 
+    def test_log_missing_instance_does_not_create_state_or_locks(self):
+        result = self.cli("log", "missing", expect=1)
+        self.assertIn(b"instance not found: missing", result.stderr)
+        self.assertFalse(self.state.exists())
+        (self.state / "instances").mkdir(parents=True)
+        result = self.cli("log", "missing", expect=1)
+        self.assertIn(b"instance not found: missing", result.stderr)
+        self.assertFalse((self.state / "locks").exists())
+        self.assertEqual(list((self.state / "instances").iterdir()), [])
+
+    def test_log_reads_readonly_state_without_locks(self):
+        path = self.make_log(b"saved output\n")
+        (self.state / "locks" / "web.lock").unlink()
+        (self.state / "locks").rmdir()
+        directories = [self.state, self.state / "instances", self.directory()]
+        files = [self.directory() / "meta.json", path]
+        try:
+            for directory in directories:
+                directory.chmod(0o500)
+            for file in files:
+                file.chmod(0o400)
+            self.assertEqual(self.cli("log", "web").stdout, b"saved output\n")
+            self.assertFalse((self.state / "locks").exists())
+            for directory in directories:
+                self.assertEqual(directory.stat().st_mode & 0o777, 0o500)
+            for file in files:
+                self.assertEqual(file.stat().st_mode & 0o777, 0o400)
+        finally:
+            for directory in directories:
+                directory.chmod(0o700)
+            for file in files:
+                file.chmod(0o600)
+
+    def test_log_does_not_wait_for_name_lock(self):
+        import fcntl
+        self.make_log(b"saved output\n")
+        with (self.state / "locks" / "web.lock").open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertEqual(self.cli("log", "web").stdout, b"saved output\n")
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_log_does_not_switch_to_replacement_after_loading_record(self):
+        self.make_log(b"old output\n")
+        notice = self.base / "log-notice"
+        env = dict(self.env, BGX_TEST_POINT="log_record_loaded", BGX_TEST_NOTIFY=str(notice))
+        child = subprocess.Popen([os.environ["BGX_FAULT_BIN"], "log", "web"], env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            deadline = time.monotonic() + 3
+            while time.monotonic() < deadline:
+                if notice.exists():
+                    status = subprocess.run(["ps", "-o", "stat=", "-p", str(child.pid)],
+                                            capture_output=True, timeout=1).stdout.strip()
+                    if status.startswith(b"T"):
+                        break
+                if child.poll() is not None:
+                    self.fail("log exited before reaching the read checkpoint")
+                time.sleep(0.005)
+            else:
+                self.fail("log did not reach the read checkpoint")
+            self.cli("rm", "web")
+            self.make_log(b"new output\n")
+            os.kill(child.pid, signal.SIGCONT)
+            out, err = child.communicate(timeout=3)
+            self.assertEqual(child.returncode, 1, err)
+            self.assertEqual(out, b"")
+            self.assertIn(b"output.log", err)
+            self.assertNotIn(b"AddressSanitizer", err)
+            self.assertNotIn(b"runtime error:", err)
+            self.assertEqual(self.cli("log", "web").stdout, b"new output\n")
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=3)
+
+    def test_log_rejects_invalid_record(self):
+        self.make_log(b"saved output\n")
+        path = self.directory() / "meta.json"
+        path.write_text("{broken")
+        result = self.cli("log", "web", expect=1)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"invalid JSON metadata", result.stderr)
+        self.assertEqual(path.read_text(), "{broken")
+
     def test_log_is_full_raw_snapshot_and_missing_log_errors(self):
         output = b"line\n" * 500 + b"\x00raw\xffwithout-final-newline"
         path = self.make_log(output)
@@ -396,7 +498,7 @@ class BgxTest(unittest.TestCase):
             self.cli(*args, expect=2)
         self.assertFalse(self.state.exists())
 
-    def test_log_snapshots_release_lock_and_ignore_appends(self):
+    def test_log_snapshots_survive_removal_and_ignore_appends(self):
         cases = [([], b"", b"a" * (2 * 1024 * 1024)),
                  (["--tail", "1"], b"skip\n", b"x" * (2 * 1024 * 1024) + b"\n")]
         for options, prefix, output in cases:

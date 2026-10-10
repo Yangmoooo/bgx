@@ -294,20 +294,25 @@ done:
     return rc;
 }
 
-int store_load(Store *s, const char *name, Record *out, Error *err) {
+static int load_record(int dir, const char *name, Record *out, Error *err) {
     memset(out, 0, sizeof(*out));
-    int dir = open_instance(s, name, false, err);
-    if (dir < 0) return errno == ENOENT ? 1 : -1;
     int fd = regular_file(dir, "meta.json", O_RDONLY, err);
-    int saved_errno = errno;
-    close(dir);
-    if (fd < 0) return saved_errno == ENOENT ? 1 : -1;
+    if (fd < 0) return errno == ENOENT ? 1 : -1;
     char *data = NULL;
     size_t length = 0;
     int rc = read_all(fd, BGX_MAX_META, &data, &length, err);
     close(fd);
     if (!rc) rc = decode_record(data, length, name, out, err);
     free(data);
+    return rc;
+}
+
+int store_load(Store *s, const char *name, Record *out, Error *err) {
+    memset(out, 0, sizeof(*out));
+    int dir = open_instance(s, name, false, err);
+    if (dir < 0) return errno == ENOENT ? 1 : -1;
+    int rc = load_record(dir, name, out, err);
+    close(dir);
     return rc;
 }
 
@@ -424,8 +429,16 @@ int store_remove(Store *s, const char *name, Error *err) {
 
 int store_log(Store *s, const char *name, Error *err) {
     int dir = open_instance(s, name, false, err);
-    if (dir < 0) return -1;
-    int fd = regular_file(dir, "output.log", O_RDONLY, err);
+    if (dir < 0) return errno == ENOENT ? fail(err, "instance not found: %s", name) : -1;
+    /* Bind metadata and log reads to one directory, even if the name is reused. */
+    Record record;
+    int loaded = load_record(dir, name, &record, err);
+    record_free(&record);
+    int fd = -1;
+    if (!loaded) {
+        bgx_test_point("log_record_loaded");
+        fd = regular_file(dir, "output.log", O_RDONLY, err);
+    } else if (loaded == 1) fail(err, "instance not found: %s", name);
     close(dir);
     return fd;
 }

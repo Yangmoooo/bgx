@@ -65,7 +65,7 @@ int store_load(Store *s, const char *name, Record *out, Error *err); /* 1: absen
 int store_save(Store *s, const Record *record, Error *err);
 int store_prepare(Store *s, const char *name, Error *err); /* owned log fd or -1 */
 int store_remove(Store *s, const char *name, Error *err);
-int store_log(Store *s, const char *name, Error *err);
+int store_log(Store *s, const char *name, Error *err); /* validates record; owned fd or -1 */
 int store_names(Store *s, char ***names, size_t *count, Error *err);
 
 typedef enum { RUNNING, EXITED, STALE, UNKNOWN } Status;

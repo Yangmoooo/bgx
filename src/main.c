@@ -220,8 +220,21 @@ static int print_log(int fd, const uintmax_t *tail, Error *err) {
     return 0;
 }
 
-static int named_operation(const char *command, const char *name, bool force,
-                           const uintmax_t *tail, int argc, char **argv, Error *err) {
+static int log_instance(const char *name, const uintmax_t *tail, Error *err) {
+    Store s;
+    int opened = store_open(&s, false, err);
+    if (opened < 0) return -1;
+    if (opened == 1) return fail(err, "instance not found: %s", name);
+    int fd = store_log(&s, name, err);
+    store_close(&s);
+    if (fd < 0) return -1;
+    int rc = print_log(fd, tail, err);
+    close(fd);
+    return rc;
+}
+
+static int mutate_instance(const char *command, const char *name, bool force,
+                           int argc, char **argv, Error *err) {
     Store s;
     if (store_open(&s, true, err)) return -1;
     int lock = store_lock(&s, name, err);
@@ -242,15 +255,11 @@ static int named_operation(const char *command, const char *name, bool force,
                 if (state == EXITED) rc = store_remove(&s, name, err);
                 else if (state == RUNNING) fail(err, "%s is running; stop it before removing", name);
                 else unsafe_status(name, state, err);
-            } else {
-                int fd = store_log(&s, name, err);
-                close(lock); lock = -1;
-                if (fd >= 0) { rc = print_log(fd, tail, err); close(fd); }
             }
         }
     }
     record_free(&record);
-    if (lock >= 0) close(lock);
+    close(lock);
     store_close(&s);
     return rc;
 }
@@ -264,11 +273,18 @@ static int list_instances(Error *err) {
     char **names = NULL;
     size_t count = 0;
     int rc = store_names(&s, &names, &count, err);
+    bool incomplete = false;
     for (size_t i = 0; !rc && i < count; ++i) {
         Record record;
-        int loaded = store_load(&s, names[i], &record, err);
+        Error load_error = {0};
+        int loaded = store_load(&s, names[i], &record, &load_error);
         if (loaded == 1) continue; /* Concurrent preparation/removal. */
-        if (loaded < 0) { rc = -1; break; }
+        if (loaded < 0) {
+            printf("%-24s %-9s %-8s %-9s %s\n", names[i], status_name(UNKNOWN), "-", "-", "-");
+            fprintf(stderr, "bgx: %s: %s\n", names[i], load_error.text);
+            incomplete = true;
+            continue;
+        }
         Error inspect_error = {0};
         Status state = observed(&record, &inspect_error);
         char pid[32] = "-", uptime[32] = "-";
@@ -290,7 +306,8 @@ static int list_instances(Error *err) {
     for (size_t i = 0; i < count; ++i) free(names[i]);
     free(names);
     store_close(&s);
-    if (!rc && fflush(stdout)) rc = syserr(err, "write output");
+    if (fflush(stdout) && !rc) rc = syserr(err, "write output");
+    if (!rc && incomplete) rc = fail(err, "some instance records could not be read");
     return rc;
 }
 
@@ -351,7 +368,8 @@ int main(int argc, char **argv) {
             /* Name is an argument, even if it is also a subcommand word. */
         } else goto syntax;
         if (valid_name(name, &err)) goto syntax;
-        rc = named_operation(command, name, force, tail, program_argc, program_argv, &err);
+        if (!strcmp(command, "log")) rc = log_instance(name, tail, &err);
+        else rc = mutate_instance(command, name, force, program_argc, program_argv, &err);
     }
     if (rc) fprintf(stderr, "bgx: %s\n", err.text[0] ? err.text : "operation failed");
     return rc ? 1 : 0;
