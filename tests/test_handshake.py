@@ -1,0 +1,233 @@
+"""Deterministic fault injection; hooks exist only in the test executable."""
+import json
+import os
+from pathlib import Path
+import signal
+import shutil
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+
+TRUE = shutil.which("true")
+
+
+@unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+class HandshakeTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix="bgx-handshake-")
+        self.base = Path(self.temp.name)
+        self.env = os.environ.copy()
+        self.env["BGX_STATE_HOME"] = str(self.base / "state")
+        self.binary = os.environ["BGX_FAULT_BIN"]
+        self.child = None
+        self.pids = set()
+        self.target_pidfile = self.base / "target-pid"
+        self.child_pidfile = self.base / "child-pid"
+        self.env["BGX_TEST_CHILD_NOTIFY"] = str(self.child_pidfile)
+
+    def tearDown(self):
+        if self.target_pidfile.exists():
+            self.pids.add(int(self.target_pidfile.read_text()))
+        if self.child_pidfile.exists():
+            self.pids.add(int(self.child_pidfile.read_text()))
+        for pid in self.pids:
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        if self.child:
+            if self.child.poll() is None:
+                self.child.kill()
+            self.child.communicate(timeout=5)
+        self.temp.cleanup()
+
+    def launch(self, point, program=None, fault=None):
+        self.env["BGX_TEST_POINT"] = point
+        self.env["BGX_TEST_NOTIFY"] = str(self.base / "notice")
+        if fault:
+            self.env["BGX_TEST_FAULT"] = fault
+        self.child = subprocess.Popen(
+            [self.binary, "start", "web", "--", *(program or ["/bin/sleep", "120"])],
+            env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            try:
+                data = (self.base / "notice").read_text().strip()
+                if data:
+                    pid = int(data)
+                    self.pids.add(pid)
+                    return pid
+            except FileNotFoundError:
+                pass
+            time.sleep(0.005)
+        self.fail("fault point not reached")
+
+    def result(self):
+        out, err = self.child.communicate(timeout=3)
+        self.assertEqual(out, b"")
+        self.assertNotEqual(self.child.returncode, 0, err)
+        self.assertNotIn(b"AddressSanitizer", err)
+        self.assertNotIn(b"runtime error:", err)
+        return err
+
+    def record(self):
+        return json.loads((self.base / "state/instances/web/meta.json").read_text())
+
+    def assert_no_record(self):
+        self.assertFalse((self.base / "state/instances/web").exists())
+
+    def assert_unknown(self):
+        self.assertTrue(self.record()["starting"])
+        plain = self.env.copy()
+        plain.pop("BGX_TEST_POINT", None)
+        plain.pop("BGX_TEST_FAULT", None)
+        listed = subprocess.run([self.binary, "ls"], env=plain, capture_output=True, timeout=2)
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIn(b"unknown", listed.stdout)
+        again = subprocess.run([self.binary, "start", "web", "--", TRUE],
+                               env=plain, capture_output=True, timeout=2)
+        self.assertNotEqual(again.returncode, 0)
+
+    def test_killed_before_ready_is_failure(self):
+        pid = self.launch("before_ready")
+        os.kill(pid, signal.SIGKILL)
+        self.result()
+        self.assert_no_record()
+
+    def test_hung_before_ready_times_out_and_reaps_child(self):
+        self.launch("before_ready")
+        self.assertIn(b"timed out", self.result())
+        self.assert_no_record()
+
+    def test_hung_before_exec_times_out_but_preserves_uncertain_record(self):
+        self.launch("before_exec")
+        self.assertIn(b"timed out", self.result())
+        self.assert_unknown()
+
+    def test_killed_before_exec_does_not_report_success(self):
+        pid = self.launch("before_exec")
+        os.kill(pid, signal.SIGKILL)
+        self.result()
+        self.assert_unknown()
+
+    def test_parent_dies_before_gate_child_cannot_execute(self):
+        marker = self.base / "executed"
+        pid = self.launch("before_gate", ["/usr/bin/touch", str(marker)])
+        self.assertEqual(pid, self.child.pid)
+        os.kill(pid, signal.SIGKILL)
+        self.child.communicate(timeout=3)
+        self.assert_unknown()
+        # The gated child sees EOF when its parent dies; no shell/executable runs.
+        self.assertFalse(marker.exists())
+
+    def test_parent_dies_after_exec_leaves_unknown_record(self):
+        code = "import os,pathlib,time; pathlib.Path(%r).write_text(str(os.getpid())); time.sleep(120)" % str(self.target_pidfile)
+        pid = self.launch("before_commit", [sys.executable, "-c", code])
+        deadline = time.monotonic() + 2
+        while not self.target_pidfile.exists() and time.monotonic() < deadline:
+            time.sleep(0.005)
+        self.assertTrue(self.target_pidfile.exists())
+        os.kill(pid, signal.SIGKILL)
+        self.child.communicate(timeout=3)
+        self.assert_unknown()
+
+    def test_killed_after_exec_notice_is_uncertain(self):
+        pid = self.launch("after_exec_notice")
+        os.kill(pid, signal.SIGKILL)
+        self.result()
+        self.assert_unknown()
+
+    def test_parent_interrupt_before_release_cleans_child(self):
+        pid = self.launch("before_gate")
+        os.kill(pid, signal.SIGTERM)
+        os.kill(pid, signal.SIGCONT)
+        self.assertIn(b"interrupted", self.result())
+        self.assert_no_record()
+
+    def test_cleanup_timeout_keeps_unknown_instead_of_hanging(self):
+        self.launch("before_ready", fault="cleanup_timeout")
+        self.assertIn(b"cleanup", self.result())
+        self.assert_unknown()
+
+    def test_commit_failure_stops_target_and_removes_record(self):
+        self.env["BGX_TEST_FAULT"] = "save_identity"
+        self.child = subprocess.Popen([self.binary, "start", "web", "--", "/bin/sleep", "120"],
+                                      env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        error = self.result()
+        self.assertIn(b"metadata write failure", error)
+        self.assertFalse((self.base / "state/instances/web").exists(), error)
+
+    def test_partial_or_invalid_exec_messages_preserve_record(self):
+        for fault in ["partial_exec_error", "invalid_exec_message"]:
+            with self.subTest(fault=fault):
+                self.env["BGX_TEST_FAULT"] = fault
+                self.child = subprocess.Popen([self.binary, "start", "web", "--", TRUE],
+                                              env=self.env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                self.result()
+                self.assert_unknown()
+                subprocess.run([self.binary, "rm", "web", "--force"], env=self.env,
+                               capture_output=True, check=True, timeout=2)
+                self.child_pidfile.unlink()
+
+    def test_signaled_target_during_eof_observation_is_uncertain(self):
+        parent = self.launch("after_eof")
+        target = int(self.child_pidfile.read_text())
+        os.kill(target, signal.SIGKILL)
+        # Wait for a dead/zombie target while the parent remains paused. This
+        # tests EOF interpretation without racing the kernel's exit bookkeeping.
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            status = subprocess.run(["ps", "-o", "stat=", "-p", str(target)],
+                                    capture_output=True, timeout=1).stdout
+            if not status.strip() or b"Z" in status:
+                break
+            time.sleep(0.005)
+        os.kill(parent, signal.SIGCONT)
+        self.result()
+        self.assert_unknown()
+
+    def test_normal_immediate_exit_including_127_is_a_successful_launch(self):
+        for status in [0, 1, 127]:
+            if self.child_pidfile.exists():
+                self.child_pidfile.unlink()
+            result = subprocess.run([self.binary, "start", "web", "--", "/bin/sh", "-c", "exit %d" % status],
+                                    env=self.env, capture_output=True, timeout=3)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            record = self.record()
+            self.assertFalse(record.get("starting", False))
+            time.sleep(0.02)
+
+    def test_production_binary_ignores_fault_configuration(self):
+        binary = os.environ.get("BGX_BIN")
+        if not binary:
+            self.skipTest("requires production binary")
+        self.env["BGX_TEST_POINT"] = "before_ready"
+        self.env["BGX_TEST_NOTIFY"] = str(self.base / "notice")
+        self.env["BGX_TEST_FAULT"] = "save_identity"
+        result = subprocess.run([binary, "start", "web", "--", TRUE],
+                                env=self.env, capture_output=True, timeout=3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse((self.base / "notice").exists())
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS libproc error convention")
+    def test_process_list_failure_does_not_mean_exited(self):
+        started = subprocess.run([self.binary, "start", "web", "--", "/bin/sleep", "120"],
+                                 env=self.env, capture_output=True, timeout=3)
+        self.assertEqual(started.returncode, 0, started.stderr)
+        original = self.record()
+        pid = original["process_identity"]["pid"]
+        self.pids.add(pid)
+        self.env["BGX_TEST_FAULT"] = "listpids_error"
+        listed = subprocess.run([self.binary, "list"], env=self.env, capture_output=True, timeout=3)
+        self.assertEqual(listed.returncode, 0, listed.stderr)
+        self.assertIn(b"unknown", listed.stdout)
+        for args in [["stop", "web"], ["remove", "web"], ["start", "web", "--", TRUE]]:
+            result = subprocess.run([self.binary, *args], env=self.env, capture_output=True, timeout=3)
+            self.assertEqual(result.returncode, 1, result.stderr)
+            self.assertEqual(self.record(), original)
+            os.kill(pid, 0)
+        self.env.pop("BGX_TEST_FAULT")
+        stopped = subprocess.run([self.binary, "stop", "web"], env=self.env, capture_output=True, timeout=3)
+        self.assertEqual(stopped.returncode, 0, stopped.stderr)
