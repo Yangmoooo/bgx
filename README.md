@@ -1,7 +1,6 @@
 # bgx
 
 把非交互命令安静地放到后台，关闭终端后仍能在另一个终端按名称找到并停止它。
-支持 macOS 和 Linux，无需守护进程或 tmux。目前仍在开发中，尚未正式发布。
 
 ```sh
 bgx start web -- python3 -m http.server 8000
@@ -20,10 +19,9 @@ make
 make install PREFIX="$HOME/.local"
 ```
 
-请确保 `~/.local/bin` 在 PATH 中。也可以直接运行 `./build/bgx`，运行时无需安装 Zig。
+请确保 `~/.local/bin` 在 PATH 中。也可以直接运行 `./build/bgx`。
 
 卸载时使用与安装相同的路径，例如 `make uninstall PREFIX="$HOME/.local"`。
-卸载只移除程序，不停止后台任务，也不删除任务数据。
 
 ## 使用
 
@@ -41,12 +39,11 @@ make install PREFIX="$HOME/.local"
 `help` → `-h` / `--help`，`version` → `-V` / `--version`。
 `bgx help COMMAND` 或 `bgx COMMAND --help` 查看命令用法，别名同样适用。
 
-名称在同一用户的状态目录内共享，允许 1–128 个 ASCII 字母（大小写均可）、数字、下划线或短横线，
-以字母或数字开头，区分大小写：`Web` 和 `web` 是不同任务。`stop`、`ls` 等子命令名也可以作为任务名。
+名称在同一用户的状态目录内共享，允许 1–128 个 ASCII 字母、数字、下划线或短横线，
+以字母或数字开头，区分大小写：`Web` 和 `web` 是不同任务。
 运行中的名称不能重复使用；任务退出后可复用名称，但会先删除旧记录和日志，即使新命令启动失败也不恢复。
 
 启动时必须使用 `--` 分隔命令。任务继承当前目录和环境，不接收终端输入，标准输出和错误合并到日志。
-需要管道、重定向等 Shell 语法时，显式使用 `sh -c`：
 
 ```sh
 bgx start build -- sh -c 'make && make test'
@@ -54,10 +51,7 @@ bgx log build | less
 bgx log build --tail 100
 ```
 
-日志不自动轮转，也没有大小上限；`log` 不持续跟随新增内容。
-`--tail N` 从文件末尾读取，N 为非负整数，0 表示不输出。
-
-## 使用边界
+## 边界
 
 - 启动成功表示程序已执行，不代表服务已经就绪或任务最终成功。
 - `stop` 先请求正常退出，等待 5 秒后仍未退出则强制终止，再等待最多 2 秒。
@@ -81,7 +75,7 @@ bgx log build --tail 100
 
 任务退出后数据仍会保留，直到删除或复用名称。开发期不保证数据格式兼容。
 
-## 开发与发布
+## 开发
 
 C17 源码统一由 Zig 构建。测试需要 Python 3，额外的内存与未定义行为检查使用 Clang。
 
