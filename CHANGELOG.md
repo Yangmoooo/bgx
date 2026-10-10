@@ -11,3 +11,4 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - 支持在 macOS 和 Linux 上按名称启动、查看和停止后台任务，关闭终端后仍可管理。
 - 支持查看任务日志、删除任务记录，以及复用已退出任务的名称。
+- 任务名支持大写字母，并区分大小写。

@@ -76,9 +76,9 @@ int valid_name(const char *name, Error *err) {
     if (!len || len > 128) return fail(err, "name must contain 1-128 characters");
     for (size_t i = 0; i < len; ++i) {
         unsigned char c = (unsigned char)name[i];
-        bool alnum = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+        bool alnum = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9');
         if (!alnum && (i == 0 || (c != '_' && c != '-')))
-            return fail(err, "name must use lowercase ASCII letters, digits, '_' or '-', beginning with a letter or digit");
+            return fail(err, "name must use ASCII letters, digits, '_' or '-', beginning with a letter or digit");
     }
     return 0;
 }

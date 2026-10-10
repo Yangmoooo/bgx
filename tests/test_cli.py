@@ -49,6 +49,14 @@ class BgxTest(unittest.TestCase):
     def record(self, name="web"):
         return json.loads((self.directory(name) / "meta.json").read_text())
 
+    def stored_record(self, name):
+        for path in (self.state / "instances").iterdir():
+            record = json.loads((path / "meta.json").read_text())
+            if record["name"] == name:
+                self.groups.add(record["process_identity"]["pid"])
+                return path, record
+        self.fail(f"no record for {name!r}")
+
     def save(self, value, name="web"):
         (self.directory(name) / "meta.json").write_text(json.dumps(value))
 
@@ -96,7 +104,7 @@ class BgxTest(unittest.TestCase):
             ("start",), ("start", "web"), ("start", "web", "true"),
             ("start", "web", "--"), ("start", "web", "--", ""),
             ("start", "../escape", "--", "true"),
-            ("start", "Upper", "--", "true"),
+            ("start", "Écho", "--", "true"),
             ("start", "a" * 129, "--", "true"),
             ("ls", "extra"), ("rm", "--force"), ("log", "web", "-f"),
             ("restart", "web"), ("forget", "web"),
@@ -216,6 +224,67 @@ class BgxTest(unittest.TestCase):
             self.start(name)
             self.cli("stop", name)
             self.cli("rm", name)
+
+    def test_case_sensitive_names_remain_independent(self):
+        names = ["web", "Web", "WEB", "wEb"]
+        stored = {}
+        for name in names:
+            self.cli("s", name, "--", "/bin/sleep", "120")
+            path, record = self.stored_record(name)
+            stored[name] = (path, record)
+            (path / "output.log").write_bytes((name + "\n").encode())
+        # Storage keys must remain distinct even when the filesystem folds case.
+        self.assertEqual(len({p.name.casefold() for p, _ in stored.values()}), len(names))
+        locks = list((self.state / "locks").iterdir())
+        self.assertEqual(len({p.stat().st_ino for p in locks}), len(names))
+        rows = [line.split() for line in self.cli("list").stdout.decode().splitlines()[1:]]
+        self.assertEqual([row[0] for row in rows], sorted(names))
+        self.assertTrue(all(row[1] == "running" for row in rows))
+        for name in names:
+            self.assertEqual(self.cli("log", name).stdout, (name + "\n").encode())
+        self.cli("s", "Web", "--", "/bin/sleep", "120", expect=1)
+        self.cli("stop", "Web")
+        self.cli("rm", "Web")
+        self.assertFalse(stored["Web"][0].exists())
+        self.cli("s", "Web", "--", "/bin/sleep", "120")
+        _, restarted = self.stored_record("Web")
+        self.assertNotEqual(restarted["process_identity"]["pid"], stored["Web"][1]["process_identity"]["pid"])
+        self.assertEqual(self.cli("log", "Web").stdout, b"")
+        self.cli("rm", "WEB", "--force")
+        self.assertFalse(stored["WEB"][0].exists())
+        os.kill(stored["WEB"][1]["process_identity"]["pid"], 0)
+        for name in ["web", "wEb"]:
+            self.assertEqual(self.cli("log", name).stdout, (name + "\n").encode())
+            os.kill(stored[name][1]["process_identity"]["pid"], 0)
+        for name in ["web", "Web", "wEb"]:
+            self.cli("stop", name)
+            self.cli("rm", name)
+        self.assertEqual(len(self.cli("list").stdout.decode().splitlines()), 1)
+
+    def test_case_sensitive_names_preserve_length_limit(self):
+        names = ["A" * 128, "a" * 128, "A" + "0_-" * 42 + "Z", "a" + "0_-" * 42 + "z"]
+        for name in names:
+            self.cli("s", name, "--", "/bin/sleep", "120")
+            path, _ = self.stored_record(name)
+            self.assertLessEqual(len(path.name), 255)
+        listed = self.cli("list").stdout.decode().splitlines()[1:]
+        self.assertEqual({line.split()[0] for line in listed}, set(names))
+        for name in names:
+            self.cli("stop", name)
+            self.cli("rm", name)
+        self.cli("s", "A" * 129, "--", "/bin/sleep", "120", expect=2)
+
+    def test_case_encoded_directory_must_be_canonical(self):
+        self.start()
+        self.cli("stop", "web")
+        original = self.directory()
+        for key in ["web.0", "web.8", "web.z", "web.11", "123.1"]:
+            moved = original.with_name(key)
+            original.rename(moved)
+            try:
+                self.cli("list", expect=1)
+            finally:
+                moved.rename(original)
 
     def test_detached_argv_cwd_environment_and_stdio(self):
         arg = 'two words "quoted"\n中文\\path'

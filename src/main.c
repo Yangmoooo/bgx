@@ -21,6 +21,7 @@ static const struct {
     const char *aliases[3];
 } commands[] = {
     {"start", "start NAME -- PROGRAM [ARGS...]", "Start a named background command.",
+     "Names are case-sensitive and accept ASCII letters, digits, '_' and '-'.\n"
      "The command inherits the current directory and environment.\n"
      "Output is logged; terminal input is disabled. Reusing an exited name deletes its old log.\n", {"s"}},
     {"stop", "stop NAME", "Stop a background command and its process group.",

@@ -12,6 +12,59 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+/* Lowercase filename plus an uppercase-position bitmap: Web -> web.1.
+   No two names differ only by filename case, even on case-insensitive volumes.
+   The longest key is 161 bytes, leaving room for the lock suffix. */
+#define NAME_KEY_SIZE (128 + 1 + 32 + 1)
+static const char hex_digits[] = "0123456789abcdef";
+
+static int name_key(const char *name, char key[NAME_KEY_SIZE], Error *err) {
+    if (valid_name(name, err)) return -1;
+    size_t length = strlen(name);
+    unsigned char uppercase[32] = {0};
+    bool has_uppercase = false;
+    for (size_t i = 0; i < length; ++i) {
+        char c = name[i];
+        if (c >= 'A' && c <= 'Z') {
+            c += 'a' - 'A';
+            uppercase[i / 4] |= 1u << (i % 4);
+            has_uppercase = true;
+        }
+        key[i] = c;
+    }
+    size_t used = length;
+    if (has_uppercase) {
+        key[used++] = '.';
+        for (size_t i = 0; i < (length + 3) / 4; ++i)
+            key[used++] = hex_digits[uppercase[i]];
+    }
+    key[used] = 0;
+    return 0;
+}
+
+static int key_name(const char *key, char name[129], Error *err) {
+    size_t length = strcspn(key, ".");
+    if (!length || length > 128) return fail(err, "invalid instance directory name");
+    memcpy(name, key, length);
+    name[length] = 0;
+    if (key[length]) {
+        if (strlen(key + length + 1) != (length + 3) / 4)
+            return fail(err, "invalid instance name encoding");
+        for (size_t i = 0; i < length; ++i) {
+            const char *digit = strchr(hex_digits, key[length + 1 + i / 4]);
+            if (!digit) return fail(err, "invalid instance name encoding");
+            if ((unsigned)(digit - hex_digits) & (1u << (i % 4))) {
+                if (name[i] < 'a' || name[i] > 'z') return fail(err, "invalid instance name encoding");
+                name[i] -= 'a' - 'A';
+            }
+        }
+    }
+    char canonical[NAME_KEY_SIZE];
+    if (name_key(name, canonical, err)) return -1;
+    if (strcmp(canonical, key)) return fail(err, "noncanonical instance directory name");
+    return 0;
+}
+
 static int mkdir_parents(const char *path, Error *err) {
     char *copy = strdup(path);
     if (!copy) return fail(err, "out of memory");
@@ -45,6 +98,12 @@ static int open_dir(int parent, const char *name, bool create, Error *err) {
         return syserr(err, "secure directory");
     }
     return fd;
+}
+
+static int open_instance(Store *s, const char *name, bool create, Error *err) {
+    char key[NAME_KEY_SIZE];
+    if (name_key(name, key, err)) return -1;
+    return open_dir(s->instances, key, create, err);
 }
 
 int store_open(Store *s, bool create, Error *err) {
@@ -113,9 +172,9 @@ void store_close(Store *s) {
 }
 
 int store_lock(Store *s, const char *name, Error *err) {
-    if (valid_name(name, err)) return -1;
-    char file[140];
-    snprintf(file, sizeof(file), "%s.lock", name);
+    char key[NAME_KEY_SIZE], file[NAME_KEY_SIZE + 5];
+    if (name_key(name, key, err)) return -1;
+    snprintf(file, sizeof(file), "%s.lock", key);
     int fd = openat(s->locks, file, O_CREAT | O_RDWR | O_NOFOLLOW | O_CLOEXEC, 0600);
     if (fd < 0) return syserr(err, "open name lock");
     struct stat st;
@@ -237,8 +296,7 @@ done:
 
 int store_load(Store *s, const char *name, Record *out, Error *err) {
     memset(out, 0, sizeof(*out));
-    if (valid_name(name, err)) return -1;
-    int dir = open_dir(s->instances, name, false, err);
+    int dir = open_instance(s, name, false, err);
     if (dir < 0) return errno == ENOENT ? 1 : -1;
     int fd = regular_file(dir, "meta.json", O_RDONLY, err);
     int saved_errno = errno;
@@ -285,7 +343,7 @@ error:
 }
 
 int store_save(Store *s, const Record *record, Error *err) {
-    int dir = open_dir(s->instances, record->name, true, err);
+    int dir = open_instance(s, record->name, true, err);
     if (dir < 0) return -1;
     cJSON *obj = encode_record(record);
     char *json = obj ? cJSON_Print(obj) : NULL;
@@ -318,7 +376,7 @@ int store_save(Store *s, const Record *record, Error *err) {
 }
 
 int store_prepare(Store *s, const char *name, Error *err) {
-    int dir = open_dir(s->instances, name, true, err);
+    int dir = open_instance(s, name, true, err);
     if (dir < 0) return -1;
     int fd = regular_file(dir, "output.log", O_CREAT | O_EXCL | O_WRONLY, err);
     close(dir);
@@ -357,14 +415,15 @@ static int remove_entry(int parent, const char *name, unsigned depth, Error *err
 }
 
 int store_remove(Store *s, const char *name, Error *err) {
-    if (valid_name(name, err)) return -1;
-    if (remove_entry(s->instances, name, 0, err)) return -1;
+    char key[NAME_KEY_SIZE];
+    if (name_key(name, key, err)) return -1;
+    if (remove_entry(s->instances, key, 0, err)) return -1;
     if (fsync(s->instances)) return syserr(err, "sync registry directory");
     return 0;
 }
 
 int store_log(Store *s, const char *name, Error *err) {
-    int dir = open_dir(s->instances, name, false, err);
+    int dir = open_instance(s, name, false, err);
     if (dir < 0) return -1;
     int fd = regular_file(dir, "output.log", O_RDONLY, err);
     close(dir);
@@ -393,8 +452,9 @@ int store_names(Store *s, char ***names, size_t *count, Error *err) {
             rc = syserr(err, "inspect registry entry"); break;
         }
         if (!S_ISDIR(st.st_mode)) continue;
-        if (valid_name(ent->d_name, err)) { rc = -1; break; }
-        char *name = strdup(ent->d_name);
+        char decoded[129];
+        if (key_name(ent->d_name, decoded, err)) { rc = -1; break; }
+        char *name = strdup(decoded);
         char **grown = realloc(*names, (*count + 1) * sizeof(**names));
         if (!name || !grown) {
             free(name);
