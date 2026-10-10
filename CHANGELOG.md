@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-10
+
 ### Added
 
 - 支持在 macOS 和 Linux 上按名称启动、查看和停止后台任务，关闭终端后仍可管理。
