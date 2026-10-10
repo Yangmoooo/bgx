@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `list` now shows invalid or unreadable records as `unknown`, reports errors by
+  name, and continues listing other tasks before exiting nonzero.
+- `log` no longer creates state directories or lock files, changes their
+  permissions, or waits for a name lock; concurrent name reuse cannot redirect
+  the read to another task's log.
+
 ## [0.1.0] - 2026-10-10
 
 ### Added
