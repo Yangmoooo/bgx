@@ -368,7 +368,19 @@ Status process_inspect(const Identity *id, Error *err) {
     ProcInfo info;
     int found = platform_process(id->pid, &info, err);
     if (found < 0) return UNKNOWN;
-    if (!found && (strcmp(info.birth, id->birth) || info.pgid != id->pgid || info.uid != geteuid())) return STALE;
+    if (!found) {
+        if (strcmp(info.birth, id->birth)) {
+            fail(err, "process start marker does not match recorded identity"); return STALE;
+        }
+        if (info.pgid != id->pgid) {
+            fail(err, "process group does not match recorded identity"); return STALE;
+        }
+        if (info.uid != geteuid()) {
+            fail(err, "effective user differs (expected %lu, found %lu)",
+                 (unsigned long)geteuid(), (unsigned long)info.uid);
+            return STALE;
+        }
+    }
     if (kill(-id->pgid, 0) < 0) {
         if (errno == ESRCH) return EXITED;
         syserr(err, "inspect process group"); return UNKNOWN;

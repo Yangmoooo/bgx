@@ -28,6 +28,9 @@ static const struct {
      "Send TERM, wait up to 5 seconds, then KILL if needed. Keep the record and log.\n", {NULL}},
     {"list", "list", "List background commands and their status.",
      "Show name, status, PID, uptime, and command.\n", {"ls", "ps"}},
+    {"info", "info NAME", "Show a task's record and current status.",
+     "Show recorded process IDs, local start time, uptime, directory, command, and log path.\n"
+     "Recorded IDs are historical metadata, not proof that a process is still running.\n", {NULL}},
     {"remove", "remove NAME [--force]", "Remove a command's record and log.",
      "The command must have exited. --force deletes data without stopping any processes.\n", {"rm"}},
     {"log", "log NAME [--tail N]", "Print a command's log.",
@@ -78,8 +81,11 @@ static void command_help(FILE *out, const char *cmd) {
 static bool is_help(const char *arg) { return !strcmp(arg, "--help") || !strcmp(arg, "-h"); }
 
 static Status observed(const Record *record, Error *err) {
-    if (record->starting) return UNKNOWN;
-    if (!record->has_identity) return EXITED;
+    if (record->starting) {
+        fail(err, "launch outcome has not been confirmed");
+        return UNKNOWN;
+    }
+    if (record->exited || !record->has_identity) return EXITED;
     return process_inspect(&record->identity, err);
 }
 
@@ -165,9 +171,8 @@ static int stop_locked(Store *s, const char *name, Record *r, Error *err) {
     if (state == RUNNING) {
         if (process_stop(&r->identity, err)) return -1;
     } else if (state != EXITED) return unsafe_status(name, state, err);
-    if (!r->has_identity) return 0;
-    r->has_identity = false;
-    memset(&r->identity, 0, sizeof(r->identity));
+    if (r->exited) return 0;
+    r->exited = true;
     return store_save(s, r, err);
 }
 
@@ -230,6 +235,70 @@ static int log_instance(const char *name, const uintmax_t *tail, Error *err) {
     if (fd < 0) return -1;
     int rc = print_log(fd, tail, err);
     close(fd);
+    return rc;
+}
+
+static void info_value(const char *label, const char *value) {
+    printf("%-14s ", label);
+    print_arg(stdout, value);
+    fputc('\n', stdout);
+}
+
+static int print_info(const Record *record, const char *log_path, Error *err) {
+    struct tm local;
+    char started[64];
+    if (!localtime_r(&record->started, &local) ||
+        !strftime(started, sizeof(started), "%Y-%m-%d %H:%M:%S %z", &local))
+        return fail(err, "cannot format local start time");
+    Error observation = {0};
+    Status state = observed(record, &observation);
+    char pid[32] = "-", pgid[32] = "-", uptime[32] = "-";
+    if (record->has_identity) {
+        snprintf(pid, sizeof(pid), "%ld", (long)record->identity.pid);
+        snprintf(pgid, sizeof(pgid), "%ld", (long)record->identity.pgid);
+    }
+    if (state == RUNNING) {
+        time_t now = time(NULL);
+        long long seconds = now > record->started ? (long long)(now - record->started) : 0;
+        snprintf(uptime, sizeof(uptime), "%02lld:%02lld:%02lld",
+                 seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+    }
+    printf("%-14s %s\n", "Name:", record->name);
+    printf("%-14s %s\n", "Status:", status_name(state));
+    if ((state == STALE || state == UNKNOWN) && observation.text[0])
+        printf("%-14s %s\n", "Reason:", observation.text);
+    printf("%-14s %s\n", "Recorded PID:", pid);
+    printf("%-14s %s\n", "Recorded PGID:", pgid);
+    printf("%-14s %s\n", "Started:", started);
+    printf("%-14s %s\n", "Uptime:", uptime);
+    info_value("Directory:", record->cwd);
+    printf("%-14s ", "Command:");
+    for (size_t i = 0; i < record->argc; ++i) {
+        if (i) fputc(' ', stdout);
+        print_arg(stdout, record->argv[i]);
+    }
+    fputc('\n', stdout);
+    info_value("Log:", log_path);
+    return fflush(stdout) ? syserr(err, "write output") : 0;
+}
+
+static int info_instance(const char *name, Error *err) {
+    Store s;
+    int opened = store_open(&s, false, err);
+    if (opened < 0) return -1;
+    if (opened == 1) return fail(err, "instance not found: %s", name);
+    Record record;
+    int loaded = store_load(&s, name, &record, err);
+    char *log_path = loaded ? NULL : store_log_path(&s, name, err);
+    store_close(&s);
+    int rc = -1;
+    if (loaded == 1) fail(err, "instance not found: %s", name);
+    else if (loaded < 0) {
+        Error cause = *err;
+        fail(err, "%s: %.360s", name, cause.text);
+    } else if (log_path) rc = print_info(&record, log_path, err);
+    free(log_path);
+    record_free(&record);
     return rc;
 }
 
@@ -364,11 +433,12 @@ int main(int argc, char **argv) {
                 if (errno == ERANGE) { fail(&err, "--tail count is too large"); goto syntax; }
                 tail = &tail_lines;
             } else if (argc != 3) goto syntax;
-        } else if (!strcmp(command, "stop") && argc == 3) {
+        } else if ((!strcmp(command, "stop") || !strcmp(command, "info")) && argc == 3) {
             /* Name is an argument, even if it is also a subcommand word. */
         } else goto syntax;
         if (valid_name(name, &err)) goto syntax;
         if (!strcmp(command, "log")) rc = log_instance(name, tail, &err);
+        else if (!strcmp(command, "info")) rc = info_instance(name, &err);
         else rc = mutate_instance(command, name, force, program_argc, program_argv, &err);
     }
     if (rc) fprintf(stderr, "bgx: %s\n", err.text[0] ? err.text : "operation failed");

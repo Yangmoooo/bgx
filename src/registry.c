@@ -240,7 +240,7 @@ static int decode_record(const char *data, size_t length, const char *name, Reco
     const char *end = NULL;
     cJSON *json = cJSON_ParseWithLengthOpts(data, length + 1, &end, 1);
     if (!json) return fail(err, "invalid JSON metadata");
-    const char *const keys[] = {"schema_version", "name", "argv", "cwd", "started_at", "starting", "process_identity", NULL};
+    const char *const keys[] = {"schema_version", "name", "argv", "cwd", "started_at", "starting", "exited", "process_identity", NULL};
     const char *const identity_keys[] = {"kind", "pid", "process_group", "start_marker", "boot_id", NULL};
     int rc = -1;
     const cJSON *schema = cJSON_GetObjectItemCaseSensitive(json, "schema_version");
@@ -249,12 +249,15 @@ static int decode_record(const char *data, size_t length, const char *name, Reco
     const char *started = string_field(json, "started_at");
     const cJSON *args = cJSON_GetObjectItemCaseSensitive(json, "argv");
     const cJSON *starting = cJSON_GetObjectItemCaseSensitive(json, "starting");
+    const cJSON *exited = cJSON_GetObjectItemCaseSensitive(json, "exited");
     const cJSON *id = cJSON_GetObjectItemCaseSensitive(json, "process_identity");
     if (!only_keys(json, keys) || !cJSON_IsNumber(schema) || schema->valuedouble != BGX_SCHEMA ||
         !stored_name || strcmp(name, stored_name) || !cwd || cwd[0] != '/' ||
         !started || parse_time(started, &r->started) || !cJSON_IsArray(args) ||
-        (starting && !cJSON_IsBool(starting))) goto invalid;
+        (starting && !cJSON_IsBool(starting)) || (exited && !cJSON_IsBool(exited))) goto invalid;
     r->starting = cJSON_IsTrue(starting);
+    r->exited = cJSON_IsTrue(exited);
+    if (r->starting && r->exited) goto invalid;
     if (id && !cJSON_IsNull(id)) {
         const char *kind = string_field(id, "kind");
         const char *birth = string_field(id, "start_marker");
@@ -332,7 +335,8 @@ static cJSON *encode_record(const Record *r) {
         if (!item) goto error;
         if (!cJSON_AddItemToArray(args, item)) { cJSON_Delete(item); goto error; }
     }
-    if (r->starting && !cJSON_AddBoolToObject(obj, "starting", 1)) goto error;
+    if (!cJSON_AddBoolToObject(obj, "starting", r->starting) ||
+        !cJSON_AddBoolToObject(obj, "exited", r->exited)) goto error;
     if (r->has_identity) {
         cJSON *id = cJSON_AddObjectToObject(obj, "process_identity");
         if (!id || !cJSON_AddStringToObject(id, "kind", "unix") ||
@@ -441,6 +445,13 @@ int store_log(Store *s, const char *name, Error *err) {
     } else if (loaded == 1) fail(err, "instance not found: %s", name);
     close(dir);
     return fd;
+}
+
+char *store_log_path(Store *s, const char *name, Error *err) {
+    char key[NAME_KEY_SIZE], relative[NAME_KEY_SIZE + sizeof("instances//output.log")];
+    if (name_key(name, key, err)) return NULL;
+    snprintf(relative, sizeof(relative), "instances/%s/output.log", key);
+    return join_path(s->path, relative, err);
 }
 
 static int compare_names(const void *a, const void *b) {

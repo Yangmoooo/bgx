@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `info NAME` shows task metadata, current status and available diagnostic reasons,
+  recorded process IDs, local start time, uptime, and log path without changing state.
+
+### Changed
+
+- `stop` retains recorded process identity and marks confirmed completion separately;
+  completed tasks no longer depend on their historical process numbers for status.
+
 ### Fixed
 
 - `list` now shows invalid or unreadable records as `unknown`, reports errors by

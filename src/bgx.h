@@ -37,6 +37,7 @@ typedef struct {
     char *cwd;
     time_t started;
     bool starting;
+    bool exited; /* Confirmed completion; retained identity is historical. */
     bool has_identity;
     Identity identity;
 } Record;
@@ -66,6 +67,7 @@ int store_save(Store *s, const Record *record, Error *err);
 int store_prepare(Store *s, const char *name, Error *err); /* owned log fd or -1 */
 int store_remove(Store *s, const char *name, Error *err);
 int store_log(Store *s, const char *name, Error *err); /* validates record; owned fd or -1 */
+char *store_log_path(Store *s, const char *name, Error *err); /* owned absolute path */
 int store_names(Store *s, char ***names, size_t *count, Error *err);
 
 typedef enum { RUNNING, EXITED, STALE, UNKNOWN } Status;

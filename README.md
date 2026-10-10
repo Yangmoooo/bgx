@@ -30,6 +30,7 @@ Uninstall with `make uninstall PREFIX="$HOME/.local"` (use your installation pre
 | --- | --- |
 | `bgx start NAME -- PROGRAM [ARGS...]` | Start a command; silent on success |
 | `bgx list` | Show names, status, PIDs, uptime, and commands |
+| `bgx info NAME` | Show task details, recorded IDs, local start time, and log path |
 | `bgx log NAME [--tail N]` | Print the full log or its last N lines, then exit |
 | `bgx stop NAME` | Stop a task, keeping its record and log |
 | `bgx remove NAME` | Delete an exited task's record and log |
@@ -53,6 +54,8 @@ environment, receive no terminal input, and combine stdout and stderr in one log
   `stop` refuses `stale` and `unknown` tasks; inspect them before clearing records.
 - `list` reports unreadable or invalid records as `unknown`, continues listing
   other tasks, and exits nonzero with errors on stderr.
+- `info` is read-only; a readable record returns success regardless of task status.
+  Recorded IDs remain available after `stop` and do not imply a live process.
 - Commands that change effective user, such as `sudo`, may need to be stopped
   manually before removing their records.
 - No automatic restarts, reboot recovery, interactive terminals, or final exit codes.

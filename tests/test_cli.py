@@ -110,6 +110,7 @@ class BgxTest(unittest.TestCase):
             ("start", "Écho", "--", "true"),
             ("start", "a" * 129, "--", "true"),
             ("ls", "extra"), ("rm", "--force"), ("log", "web", "-f"),
+            ("info",), ("info", "web", "extra"), ("info", "../escape"), ("info", "web", "--json"),
             ("restart", "web"), ("forget", "web"),
             ("completion", "bash"), ("logpath", "web"),
             ("-v",), ("up", "web", "--", "true"), ("down", "web"),
@@ -139,12 +140,178 @@ class BgxTest(unittest.TestCase):
                 self.assertIn(b"invalid", result.stderr)
                 self.assertEqual(meta.read_text(), contents)
 
+    def test_info_shows_recorded_fields_and_local_time(self):
+        self.cli("start", "Web", "--", "/bin/sleep", "120")
+        directory, record = self.stored_record("Web")
+        record["started_at"] = "2026-01-02T03:04:05Z"
+        meta = directory / "meta.json"
+        meta.write_text(json.dumps(record))
+        before = meta.read_bytes()
+        for zone, expected in [("UTC0", "2026-01-02 03:04:05 +0000"),
+                               ("CST-8", "2026-01-02 11:04:05 +0800"),
+                               ("EST5", "2026-01-01 22:04:05 -0500")]:
+            with self.subTest(zone=zone):
+                result = self.cli("info", "Web", env=dict(self.env, TZ=zone))
+                self.assertEqual(result.stderr, b"")
+                fields = dict(line.split(":", 1) for line in result.stdout.decode().splitlines())
+                fields = {key: value.strip() for key, value in fields.items()}
+                self.assertEqual(fields["Name"], "Web")
+                self.assertEqual(fields["Status"], "running")
+                self.assertEqual(fields["Recorded PID"], str(record["process_identity"]["pid"]))
+                self.assertEqual(fields["Recorded PGID"], str(record["process_identity"]["process_group"]))
+                self.assertEqual(fields["Started"], expected)
+                self.assertRegex(fields["Uptime"], r"^\d{2,}:\d{2}:\d{2}$")
+                self.assertEqual(fields["Directory"], json.dumps(str(self.cwd)))
+                self.assertEqual(fields["Command"], "/bin/sleep 120")
+                self.assertEqual(Path(fields["Log"]), directory / "output.log")
+                self.assertNotIn("Reason", fields)
+                self.assertEqual(meta.read_bytes(), before)
+        self.cli("stop", "Web")
+        result = self.cli("info", "Web")
+        fields = {key: value.strip() for key, value in
+                  (line.split(":", 1) for line in result.stdout.decode().splitlines())}
+        self.assertEqual(fields["Status"], "exited")
+        self.assertEqual(fields["Uptime"], "-")
+        self.assertEqual(fields["Recorded PID"], str(record["process_identity"]["pid"]))
+
+    def test_info_explains_stale_and_unknown_without_mutating_records(self):
+        original = self.start()
+        stale = deepcopy(original)
+        stale["process_identity"]["start_marker"] += "-wrong"
+        pending = deepcopy(original)
+        pending.pop("process_identity")
+        pending["starting"] = True
+        for record, status, reason in [(stale, "stale", "start marker"),
+                                       (pending, "unknown", "launch")]:
+            with self.subTest(status=status):
+                self.save(record)
+                before = (self.directory() / "meta.json").read_bytes()
+                result = self.cli("info", "web")
+                fields = {key: value.strip() for key, value in
+                          (line.split(":", 1) for line in result.stdout.decode().splitlines())}
+                self.assertEqual(result.stderr, b"")
+                self.assertEqual(fields["Status"], status)
+                self.assertIn(reason, fields["Reason"])
+                self.assertEqual(fields["Uptime"], "-")
+                if status == "unknown":
+                    self.assertEqual(fields["Recorded PID"], "-")
+                    self.assertEqual(fields["Recorded PGID"], "-")
+                self.cli("stop", "web", expect=1)
+                self.assertEqual((self.directory() / "meta.json").read_bytes(), before)
+                os.kill(original["process_identity"]["pid"], 0)
+        self.save(original)
+        self.cli("stop", "web")
+
+    def test_info_missing_and_invalid_records_report_named_errors(self):
+        result = self.cli("info", "missing", expect=1)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"instance not found: missing", result.stderr)
+        self.assertFalse(self.state.exists())
+        self.make_log()
+        meta = self.directory() / "meta.json"
+        for contents in ["{broken", '{"schema_version": 999}']:
+            meta.write_text(contents)
+            result = self.cli("info", "web", expect=1)
+            self.assertEqual(result.stdout, b"")
+            self.assertIn(b"web", result.stderr)
+            self.assertIn(b"invalid", result.stderr)
+            self.assertEqual(meta.read_text(), contents)
+        result = self.cli("info", "missing", expect=1)
+        self.assertEqual(result.stdout, b"")
+        self.assertFalse((self.state / "locks" / "missing.lock").exists())
+
+    def test_info_is_readonly_and_does_not_need_name_locks(self):
+        import fcntl
+        self.make_log()
+        meta = self.directory() / "meta.json"
+        before = meta.read_bytes()
+        with (self.state / "locks" / "web.lock").open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            self.assertIn(b"exited", self.cli("info", "web").stdout)
+        (self.state / "locks" / "web.lock").unlink()
+        (self.state / "locks").rmdir()
+        (self.directory() / "output.log").unlink()  # Info does not require a log to exist.
+        directories = [self.state, self.state / "instances", self.directory()]
+        try:
+            for directory in directories:
+                directory.chmod(0o500)
+            meta.chmod(0o400)
+            self.assertIn(b"exited", self.cli("info", "web").stdout)
+            self.assertFalse((self.state / "locks").exists())
+            self.assertEqual(meta.read_bytes(), before)
+            self.assertEqual(meta.stat().st_mode & 0o777, 0o400)
+            for directory in directories:
+                self.assertEqual(directory.stat().st_mode & 0o777, 0o500)
+        finally:
+            for directory in directories:
+                directory.chmod(0o700)
+            meta.chmod(0o600)
+
+    def test_confirmed_completion_never_rechecks_historical_identity(self):
+        unrelated = self.start("other")
+        for operation in ["stop", "rm", "reuse"]:
+            with self.subTest(operation=operation):
+                self.start()
+                self.cli("stop", "web")
+                ended = self.record()
+                ended["process_identity"] = deepcopy(unrelated["process_identity"])
+                ended["process_identity"]["start_marker"] += "-historical"
+                self.save(ended)
+                before = (self.directory() / "meta.json").read_bytes()
+                self.assertIn(b"Status:        exited", self.cli("info", "web").stdout)
+                self.assertEqual((self.directory() / "meta.json").read_bytes(), before)
+                if operation == "reuse":
+                    self.start()
+                    self.assertFalse(self.record()["exited"])
+                    self.cli("stop", "web")
+                else:
+                    self.cli(operation, "web")
+                    if operation == "stop":
+                        self.assertEqual((self.directory() / "meta.json").read_bytes(), before)
+                os.kill(unrelated["process_identity"]["pid"], 0)
+        self.cli("stop", "other")
+
+    def test_legacy_records_remain_readable(self):
+        original = self.start()
+        legacy = deepcopy(original)
+        legacy.pop("exited")
+        legacy.pop("starting")
+        self.save(legacy)
+        self.assertIn(b"Status:        running", self.cli("info", "web").stdout)
+        self.cli("stop", "web")
+        self.assertEqual(self.record()["process_identity"], legacy["process_identity"])
+        legacy.pop("process_identity")
+        self.save(legacy)
+        before = (self.directory() / "meta.json").read_bytes()
+        result = self.cli("info", "web")
+        self.assertIn(b"Status:        exited", result.stdout)
+        self.assertIn(b"Recorded PID:  -", result.stdout)
+        self.assertIn(b"Recorded PGID: -", result.stdout)
+        self.assertEqual((self.directory() / "meta.json").read_bytes(), before)
+        self.cli("stop", "web")
+        self.cli("rm", "web")
+
+    def test_conflicting_or_invalid_completion_markers_are_rejected(self):
+        original = self.start()
+        for changes in [{"starting": True, "exited": True}, {"exited": "yes"}, {"exited": 1}]:
+            with self.subTest(changes=changes):
+                record = deepcopy(original)
+                record.update(changes)
+                self.save(record)
+                before = (self.directory() / "meta.json").read_bytes()
+                self.cli("info", "web", expect=1)
+                self.cli("stop", "web", expect=1)
+                self.assertEqual((self.directory() / "meta.json").read_bytes(), before)
+                os.kill(original["process_identity"]["pid"], 0)
+        self.save(original)
+        self.cli("stop", "web")
+
     def test_help_and_aliases(self):
         general = self.cli("help").stdout
         self.assertIn(b"bgx start NAME", general)
         for args in [(), ("-h",), ("--help",)]:
             self.assertEqual(self.cli(*args).stdout, general)
-        commands = {"start": ["s"], "stop": [], "list": ["ls", "ps"], "remove": ["rm"],
+        commands = {"start": ["s"], "stop": [], "list": ["ls", "ps"], "info": [], "remove": ["rm"],
                     "log": ["logs"], "help": ["-h", "--help"], "version": ["-V", "--version"]}
         for command, aliases in commands.items():
             with self.subTest(command=command):
@@ -179,6 +346,22 @@ class BgxTest(unittest.TestCase):
             self.assertEqual(self.cli("logs", "web", "--tail", "1").stdout, b"ready\n")
             self.cli(removal, "web")
             self.assertFalse(self.directory().exists())
+
+    def test_stop_preserves_launch_metadata_and_records_completion(self):
+        original = self.start()
+        log = (self.directory() / "output.log").read_bytes()
+        self.cli("stop", "web")
+        stopped = self.record()
+        self.assertEqual(stopped.get("process_identity"), original["process_identity"])
+        self.assertTrue(stopped["exited"])
+        for key, value in original.items():
+            if key != "exited":
+                self.assertEqual(stopped[key], value, key)
+        self.assertEqual((self.directory() / "output.log").read_bytes(), log)
+        saved = (self.directory() / "meta.json").read_bytes()
+        self.cli("stop", "web")
+        self.assertEqual((self.directory() / "meta.json").read_bytes(), saved)
+        self.assertIn(b"exited", self.cli("list").stdout)
 
     def test_stopped_name_can_be_restarted_and_removed(self):
         previous = None
@@ -235,7 +418,7 @@ class BgxTest(unittest.TestCase):
         self.cli("rm", "web")
 
     def test_names_can_be_subcommands(self):
-        for name in ["start", "s", "stop", "list", "ls", "ps", "remove", "rm", "log", "logs", "help", "version"]:
+        for name in ["start", "s", "stop", "list", "ls", "ps", "info", "remove", "rm", "log", "logs", "help", "version"]:
             self.start(name)
             self.cli("stop", name)
             self.cli("rm", name)
@@ -313,7 +496,8 @@ class BgxTest(unittest.TestCase):
         self.assertIn(b"running", self.cli("ls", cwd=self.base).stdout)
         self.cli("stop", "web", cwd=self.base)
         self.assertEqual(self.cli("log", "web").stdout, output)
-        self.assertNotIn("process_identity", self.record())
+        self.assertEqual(self.record()["process_identity"], record["process_identity"])
+        self.assertTrue(self.record()["exited"])
         self.cli("stop", "web")  # idempotent
         self.cli("rm", "web")
         self.assertFalse(self.directory().exists())
@@ -550,7 +734,8 @@ class BgxTest(unittest.TestCase):
                 self.assertEqual(row[:4], ["web", "exited", "-", "-"])
                 if operation == "stop":
                     self.cli("stop", "web")
-                    self.assertNotIn("process_identity", self.record())
+                    self.assertEqual(self.record()["process_identity"], old["process_identity"])
+                    self.assertTrue(self.record()["exited"])
                 elif operation == "rm":
                     self.cli("rm", "web")
                     self.assertFalse(self.directory().exists())
