@@ -1,6 +1,7 @@
 /* Compiled only into the fault-test executable, never the shipped binary. */
 #include "bgx.h"
 
+#include <errno.h>
 #include <fcntl.h>
 #include <signal.h>
 #include <stdlib.h>
@@ -36,5 +37,9 @@ void bgx_test_point(const char *point) {
     Error err = {0};
     if (write_all(fd, data, (size_t)length, &err)) _exit(126);
     close(fd);
+    if (bgx_test_fault("delay_before_stop")) {
+        struct timespec delay = {.tv_nsec = 100000000};
+        while (nanosleep(&delay, &delay) && errno == EINTR) {}
+    }
     raise(SIGSTOP);
 }

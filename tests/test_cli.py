@@ -173,6 +173,44 @@ class BgxTest(unittest.TestCase):
         self.assertFalse(self.directory().exists())
         self.assertEqual(len(self.cli("list").stdout.decode().splitlines()), 1)
 
+    @unittest.skipUnless(sys.platform == "linux" and os.geteuid() != 0,
+                         "requires a non-root Linux process")
+    def test_stop_with_unreaped_root_does_not_become_stale(self):
+        import ctypes
+        libc = ctypes.CDLL(None, use_errno=True)
+        previous = ctypes.c_int()
+        self.assertEqual(libc.prctl(37, ctypes.byref(previous), 0, 0, 0), 0)  # GET_CHILD_SUBREAPER
+        self.assertEqual(libc.prctl(36, 1, 0, 0, 0), 0)  # SET_CHILD_SUBREAPER
+        pid = None
+        try:
+            pid = self.start()["process_identity"]["pid"]
+            # Adopt the target when bgx exits. Keeping it unreaped makes the
+            # /proc ownership change during exit deterministic, without PID reuse.
+            self.cli("stop", "web")
+            self.assertIn(b"exited", self.cli("list").stdout)
+            self.cli("rm", "web")
+            self.assertFalse(self.directory().exists())
+        finally:
+            if pid is not None:
+                os.kill(pid, signal.SIGKILL)
+                os.waitpid(pid, 0)
+                self.groups.discard(pid)
+            self.assertEqual(libc.prctl(36, previous.value, 0, 0, 0), 0)
+
+    @unittest.skipUnless(sys.platform == "linux" and os.geteuid() != 0,
+                         "requires a non-root Linux process")
+    def test_nondumpable_task_uses_effective_uid_not_proc_owner(self):
+        record = self.start(code=(
+            "import ctypes,time;"
+            "libc=ctypes.CDLL(None);"
+            "assert libc.prctl(4,0,0,0,0)==0;"  # PR_SET_DUMPABLE
+            "print('ready',flush=True);time.sleep(120)"
+        ))
+        self.assertEqual(os.stat(f"/proc/{record['process_identity']['pid']}/stat").st_uid, 0)
+        self.assertIn(b"running", self.cli("list").stdout)
+        self.cli("stop", "web")
+        self.cli("rm", "web")
+
     def test_names_can_be_subcommands(self):
         for name in ["start", "s", "stop", "list", "ls", "ps", "remove", "rm", "log", "logs", "help", "version"]:
             self.start(name)

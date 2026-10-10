@@ -6,7 +6,6 @@
 #include <limits.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 int platform_boot(char out[80], Error *err) {
@@ -24,28 +23,57 @@ int platform_boot(char out[80], Error *err) {
     return rc;
 }
 
+static int read_process_file(int dir, const char *name, char **data, Error *err) {
+    int fd = openat(dir, name, O_RDONLY | O_CLOEXEC);
+    if (fd < 0) {
+        if (errno == ENOENT || errno == ESRCH) return 1;
+        return syserr(err, "open process information");
+    }
+    size_t length = 0;
+    int rc = read_all(fd, 1024 * 1024, data, &length, err);
+    int saved_errno = errno;
+    close(fd);
+    if (rc && saved_errno == ESRCH) return 1;
+    return rc;
+}
+
+static int effective_uid(char *status, uid_t *uid, Error *err) {
+    char *save = NULL;
+    for (char *line = strtok_r(status, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        if (strncmp(line, "Uid:", 4)) continue;
+        unsigned long real, effective, saved, filesystem;
+        char extra;
+        if (sscanf(line + 4, "%lu %lu %lu %lu %c", &real, &effective, &saved, &filesystem, &extra) != 4 ||
+            (unsigned long)(uid_t)effective != effective)
+            return fail(err, "malformed process UID");
+        *uid = (uid_t)effective;
+        return 0;
+    }
+    return fail(err, "missing process UID");
+}
+
 int platform_process(pid_t pid, ProcInfo *out, Error *err) {
     memset(out, 0, sizeof(*out));
     char path[80];
-    snprintf(path, sizeof(path), "/proc/%ld/stat", (long)pid);
-    int fd = open(path, O_RDONLY | O_CLOEXEC);
-    if (fd < 0) {
+    snprintf(path, sizeof(path), "/proc/%ld", (long)pid);
+    int dir = open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir < 0) {
         if (errno == ENOENT || errno == ESRCH) return 1;
-        return syserr(err, "read process stat");
+        return syserr(err, "open process directory");
     }
-    struct stat st;
-    if (fstat(fd, &st)) { close(fd); return syserr(err, "stat process identity"); }
-    char *data = NULL;
-    size_t length = 0;
-    int rc = read_all(fd, 1024 * 1024, &data, &length, err);
-    close(fd);
-    if (rc) return rc;
+    /* Keep both reads tied to this PID's directory. /proc file ownership can
+       become root for a non-dumpable or exiting task without its EUID changing. */
+    char *data = NULL, *status = NULL;
+    int rc = read_process_file(dir, "stat", &data, err);
+    if (!rc) rc = read_process_file(dir, "status", &status, err);
+    close(dir);
+    if (!rc) rc = effective_uid(status, &out->uid, err);
+    free(status);
+    if (rc) { free(data); return rc; }
     char *end = strrchr(data, ')');
     if (!end || end[1] != ' ') { free(data); return fail(err, "malformed process stat"); }
     char *save = NULL, *field = strtok_r(end + 2, " ", &save);
     bool have_group = false, have_birth = false, have_flags = false;
-    memset(out, 0, sizeof(*out));
-    out->uid = st.st_uid;
     for (int index = 0; field; ++index, field = strtok_r(NULL, " ", &save)) {
         if (index == 0) out->zombie = field[0] == 'Z' || field[0] == 'X';
         if (index == 2) {

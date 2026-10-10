@@ -58,11 +58,16 @@ class HandshakeTest(unittest.TestCase):
                 if data:
                     pid = int(data)
                     self.pids.add(pid)
-                    return pid
+                    # Notification is written before raise(SIGSTOP). Sending
+                    # SIGCONT before the stop takes effect loses the wakeup.
+                    status = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)],
+                                            capture_output=True, timeout=1).stdout.strip()
+                    if status.startswith(b"T"):
+                        return pid
             except FileNotFoundError:
                 pass
             time.sleep(0.005)
-        self.fail("fault point not reached")
+        self.fail("fault process did not reach the stopped state")
 
     def result(self):
         out, err = self.child.communicate(timeout=3)
@@ -140,7 +145,7 @@ class HandshakeTest(unittest.TestCase):
         self.assert_unknown()
 
     def test_parent_interrupt_before_release_cleans_child(self):
-        pid = self.launch("before_gate")
+        pid = self.launch("before_gate", fault="delay_before_stop")
         os.kill(pid, signal.SIGTERM)
         os.kill(pid, signal.SIGCONT)
         self.assertIn(b"interrupted", self.result())
