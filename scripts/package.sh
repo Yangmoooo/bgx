@@ -38,7 +38,7 @@ for arch in amd64 arm64; do
     [[ $("$stage/bgx" --version) == "bgx $version" ]]
     BGX_BIN="$stage/bgx" python3 -m unittest discover -s tests -v
   fi
-  archive="dist/bgx_${tag}_${target_os}_${arch}.tar.gz"
+  archive="dist/bgx-${target_os}-${arch}.tar.gz"
   tar -czf "$archive" -C "$stage" bgx README.md CHANGELOG.md cJSON-LICENSE
   echo "$archive"
 done

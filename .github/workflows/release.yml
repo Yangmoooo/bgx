@@ -48,7 +48,7 @@ jobs:
       - uses: actions/upload-artifact@v7
         with:
           name: bgx-${{ matrix.platform }}
-          path: dist/*.tar.gz
+          path: dist/bgx-${{ matrix.platform }}-*.tar.gz
           if-no-files-found: error
 
   publish:
@@ -73,16 +73,16 @@ jobs:
         run: |
           bash scripts/release-notes.sh "$RELEASE_TAG" > "$RUNNER_TEMP/release-notes.md"
           cd dist
-          for target in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64; do
-            test -s "bgx_${RELEASE_TAG}_${target}.tar.gz"
+          for target in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
+            test -s "bgx-${target}.tar.gz"
           done
-          sha256sum bgx_*.tar.gz > SHA256SUMS
+          sha256sum bgx-*.tar.gz > SHA256SUMS
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
-          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/SHA256SUMS \
+          gh release create "$RELEASE_TAG" dist/bgx-*.tar.gz dist/SHA256SUMS \
             --verify-tag --title "bgx ${RELEASE_TAG#v}" \
             --notes-file "$RUNNER_TEMP/release-notes.md"
