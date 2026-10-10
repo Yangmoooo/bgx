@@ -17,7 +17,9 @@ BINARY = Path(os.environ.get("BGX_BIN", "build/bgx")).resolve()
 class BgxTest(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix="bgx-test-")
-        self.base = Path(self.temp.name)
+        # getcwd() reports the physical path (e.g. /private/var on macOS, where
+        # /var is a symlink), so keep fixture paths physical for comparisons.
+        self.base = Path(self.temp.name).resolve()
         self.state = self.base / "state"
         self.cwd = self.base / "project with spaces"
         self.cwd.mkdir()
