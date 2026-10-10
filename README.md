@@ -32,6 +32,7 @@ Uninstall with `make uninstall PREFIX="$HOME/.local"` (use your installation pre
 | `bgx list` | Show names, status, PIDs, uptime, and commands |
 | `bgx info NAME` | Show task details, recorded IDs, local start time, and log path |
 | `bgx log NAME [--tail N]` | Print the full log or its last N lines, then exit |
+| `bgx log NAME -f` | Follow the log, printing existing and appended output |
 | `bgx stop NAME` | Stop a task, keeping its record and log |
 | `bgx remove NAME` | Delete an exited task's record and log |
 | `bgx remove NAME --force` | Delete data only; **does not stop processes** |
@@ -56,6 +57,12 @@ environment, receive no terminal input, and combine stdout and stderr in one log
   other tasks, and exits nonzero with errors on stderr.
 - `info` is read-only; a readable record returns success regardless of task status.
   Recorded IDs remain available after `stop` and do not imply a live process.
+- `log -f`/`--follow` prints the existing log (all of it, or the last `--tail N`
+  lines with `--tail 0` printing none), then streams appended bytes until
+  interrupted or the output closes. It stays with the log opened for that
+  execution when the name is reused, and restarts from the file's beginning if
+  the file is observed to shrink. A closed output pipe exits 0 quietly; Ctrl-C
+  stops only the viewer, not the task.
 - Commands that change effective user, such as `sudo`, may need to be stopped
   manually before removing their records.
 - No automatic restarts, reboot recovery, interactive terminals, or final exit codes.

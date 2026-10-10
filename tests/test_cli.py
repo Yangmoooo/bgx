@@ -3,6 +3,7 @@ from copy import deepcopy
 from datetime import datetime, timezone
 import os
 from pathlib import Path
+import select
 import signal
 import subprocess
 import sys
@@ -24,8 +25,16 @@ class BgxTest(unittest.TestCase):
         self.env["BGX_STATE_HOME"] = str(self.state)
         self.env["BGX_TEST_VALUE"] = "inherited value"
         self.groups = set()
+        self.followers = []
 
     def tearDown(self):
+        for child in self.followers:
+            if child.poll() is None:
+                child.kill()
+            try:
+                child.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                pass
         for pgid in self.groups:
             try:
                 os.killpg(pgid, signal.SIGKILL)
@@ -101,6 +110,49 @@ class BgxTest(unittest.TestCase):
             time.sleep(0.02)
         self.fail("instance did not exit")
 
+    def spawn(self, command):
+        child = subprocess.Popen(
+            [str(BINARY), *command], env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=0
+        )
+        self.followers.append(child)
+        return child
+
+    def follow(self, *options, name="web"):
+        return self.spawn(["log", name, *options, "--follow"])
+
+    def expect_output(self, child, expected, timeout=5):
+        data = b""
+        deadline = time.monotonic() + timeout
+        while len(data) < len(expected):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                self.fail(f"timed out with {data!r} waiting for {expected[len(data):]!r}")
+            if not select.select([child.stdout], [], [], remaining)[0]:
+                self.fail(f"timed out with {data!r} waiting for {expected[len(data):]!r}")
+            chunk = os.read(child.stdout.fileno(), len(expected) - len(data))
+            if not chunk:
+                self.fail(f"output ended after {data!r} of {expected!r}")
+            data += chunk
+        self.assertEqual(data, expected)
+        return data
+
+    def expect_no_output(self, child, window=0.5):
+        if not select.select([child.stdout], [], [], window)[0]:
+            return
+        extra = os.read(child.stdout.fileno(), 4096)
+        if not extra:
+            self.fail("follow ended before the viewer was interrupted")
+        self.fail(f"unexpected follow output: {extra!r}")
+
+    def stop_follow(self, child):
+        child.send_signal(signal.SIGINT)
+        out, err = child.communicate(timeout=5)
+        self.assertEqual(child.returncode, -signal.SIGINT, (out, err))
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b"")
+        self.followers.remove(child)
+
     def test_invalid_arguments(self):
         for args in [
             ("web", "--", "true"), ("run", "web", "--", "true"),
@@ -109,7 +161,10 @@ class BgxTest(unittest.TestCase):
             ("start", "../escape", "--", "true"),
             ("start", "Écho", "--", "true"),
             ("start", "a" * 129, "--", "true"),
-            ("ls", "extra"), ("rm", "--force"), ("log", "web", "-f"),
+            ("ls", "extra"), ("rm", "--force"),
+            ("log", "web", "-f", "--tail"), ("log", "web", "--follow", "--follow"),
+            ("log", "web", "--follow=1"), ("log", "-f"), ("log", "--follow", "--tail", "1"),
+            ("log", "web", "--tail", "1", "-f", "extra"),
             ("info",), ("info", "web", "extra"), ("info", "../escape"), ("info", "web", "--json"),
             ("restart", "web"), ("forget", "web"),
             ("completion", "bash"), ("logpath", "web"),
@@ -330,6 +385,7 @@ class BgxTest(unittest.TestCase):
             self.assertEqual(self.cli(alias).stdout, version)
         self.assertNotIn(b"bgx start", self.cli("help", "log").stdout)
         self.assertIn(b"--tail N", self.cli("help", "log").stdout)
+        self.assertIn(b"--follow", self.cli("help", "log").stdout)
         self.cli("help", "missing", expect=2)
         self.assertFalse(self.state.exists())
 
@@ -703,6 +759,222 @@ class BgxTest(unittest.TestCase):
                     if child.poll() is None:
                         child.kill()
                         child.wait()
+
+    def test_log_follow_prints_history_then_appends_raw_bytes(self):
+        marker = self.base / "append-now"
+        code = (
+            "import os,sys,time\n"
+            "print('one',flush=True)\n"
+            "sys.stdout.write('partial')\n"
+            "sys.stdout.flush()\n"
+            "while not os.path.exists(sys.argv[1]): time.sleep(0.01)\n"
+            "sys.stdout.write('-two'+chr(10))\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(120)\n"
+        )
+        self.cli("start", "web", "--", sys.executable, "-c", code, str(marker))
+        record = self.track()
+        child = self.follow()
+        self.expect_output(child, b"one\npartial")
+        self.expect_no_output(child)
+        marker.write_text("go")
+        self.expect_output(child, b"-two\n")
+        self.expect_no_output(child)
+        self.stop_follow(child)
+        os.kill(record["process_identity"]["pid"], 0)
+        self.assertIn(b"Status:        running", self.cli("info", "web").stdout)
+        self.cli("stop", "web")
+
+    def test_log_follow_tail_selection_and_zero_starts_at_end(self):
+        path = self.make_log(b"a\nb\nc\n")
+        child = self.follow("--tail", "1")
+        self.expect_output(child, b"c\n")
+        self.expect_no_output(child)
+        with path.open("ab") as stream:
+            stream.write(b"d\n")
+        self.expect_output(child, b"d\n")
+        self.stop_follow(child)
+        child = self.follow("--tail", "0")
+        self.expect_no_output(child)
+        with path.open("ab") as stream:
+            stream.write(b"new\n")
+        self.expect_output(child, b"new\n")
+        self.stop_follow(child)
+
+    def test_log_follow_accepts_options_before_or_after_name_and_logs_alias(self):
+        self.make_log(b"kept\n")
+        for command in [["log", "-f", "web"],
+                        ["log", "--tail", "1", "web", "-f"],
+                        ["log", "web", "-f", "--tail", "1"],
+                        ["logs", "--follow", "web", "--tail", "1"]]:
+            with self.subTest(command=command):
+                child = self.spawn(command)
+                self.expect_output(child, b"kept\n")
+                self.expect_no_output(child)
+                self.stop_follow(child)
+
+    def test_log_follow_survives_unlink_with_live_writer(self):
+        marker = self.base / "after-unlink"
+        code = (
+            "import os,sys,time\n"
+            "print('ready',flush=True)\n"
+            "while not os.path.exists(sys.argv[1]): time.sleep(0.01)\n"
+            "print('after-unlink',flush=True)\n"
+            "time.sleep(120)\n"
+        )
+        self.cli("start", "web", "--", sys.executable, "-c", code, str(marker))
+        self.track()
+        child = self.follow()
+        self.expect_output(child, b"ready\n")
+        (self.directory() / "output.log").unlink()
+        marker.write_text("go")
+        self.expect_output(child, b"after-unlink\n")
+        self.stop_follow(child)
+        self.cli("stop", "web")
+        self.cli("rm", "web")
+
+    def test_log_follow_keeps_original_file_when_name_is_reused(self):
+        marker = self.base / "exit-now"
+        code = (
+            "import os,sys,time\n"
+            "print('alpha',flush=True)\n"
+            "while not os.path.exists(sys.argv[1]): time.sleep(0.01)\n"
+            "print('alpha2',flush=True)\n"
+        )
+        self.cli("start", "web", "--", sys.executable, "-c", code, str(marker))
+        self.track()
+        child = self.follow()
+        self.expect_output(child, b"alpha\n")
+        marker.write_text("go")
+        self.expect_output(child, b"alpha2\n")
+        self.wait_exited()
+        self.cli("start", "web", "--", "/bin/echo", "beta")
+        self.track()
+        self.wait_log(b"beta")
+        self.assertIsNone(child.poll())
+        self.expect_no_output(child)
+        self.stop_follow(child)
+        self.wait_exited()
+        self.cli("rm", "web")
+
+    def test_log_follow_recovers_from_observed_truncation(self):
+        path = self.make_log(b"first line\nsecond line\n")
+        child = self.follow()
+        self.expect_output(child, b"first line\nsecond line\n")
+        self.expect_no_output(child)
+        path.write_bytes(b"replacement\n")
+        self.expect_output(child, b"replacement\n")
+        self.expect_no_output(child)
+        self.stop_follow(child)
+
+    def test_log_follow_stays_after_task_exit_and_interrupt_ends_only_viewer(self):
+        path = self.make_log(b"done\n")
+        child = self.follow()
+        self.expect_output(child, b"done\n")
+        self.expect_no_output(child)
+        self.assertIsNone(child.poll())
+        self.assertIn(b"exited", self.cli("info", "web").stdout)
+        with path.open("ab") as stream:
+            stream.write(b"after exit\n")
+        self.expect_output(child, b"after exit\n")
+        self.expect_no_output(child)
+        self.stop_follow(child)
+
+    def test_log_follow_startup_errors_are_immediate_and_readonly(self):
+        result = self.cli("log", "missing", "--follow", expect=1)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"instance not found: missing", result.stderr)
+        self.assertFalse(self.state.exists())
+        path = self.make_log(b"data\n")
+        meta = self.directory() / "meta.json"
+        record = self.record()
+        locks = sorted(entry.name for entry in (self.state / "locks").iterdir())
+        path.unlink()
+        result = self.cli("log", "-f", "web", expect=1)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"output.log", result.stderr)
+        path.write_bytes(b"data\n")
+        meta.write_text("{broken")
+        result = self.cli("log", "web", "--follow", expect=1)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"invalid JSON metadata", result.stderr)
+        self.assertEqual(meta.read_text(), "{broken")
+        self.save(record)
+        if os.geteuid() != 0:
+            path.chmod(0)
+            try:
+                result = self.cli("log", "web", "-f", expect=1)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"output.log", result.stderr)
+            finally:
+                path.chmod(0o600)
+        self.assertEqual(sorted(entry.name for entry in (self.state / "locks").iterdir()), locks)
+
+    def test_log_follow_is_readonly_and_ignores_name_lock(self):
+        import fcntl
+        path = self.make_log(b"saved output\n")
+        meta = self.directory() / "meta.json"
+        with (self.state / "locks" / "web.lock").open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            child = self.follow()
+            self.expect_output(child, b"saved output\n")
+            self.stop_follow(child)
+        (self.state / "locks" / "web.lock").unlink()
+        (self.state / "locks").rmdir()
+        before = meta.read_bytes()
+        directories = [self.state, self.state / "instances", self.directory()]
+        files = [meta, path]
+        try:
+            for directory in directories:
+                directory.chmod(0o500)
+            for file in files:
+                file.chmod(0o400)
+            child = self.follow()
+            self.expect_output(child, b"saved output\n")
+            self.expect_no_output(child)
+            self.stop_follow(child)
+            self.assertFalse((self.state / "locks").exists())
+            self.assertEqual(meta.read_bytes(), before)
+            for directory in directories:
+                self.assertEqual(directory.stat().st_mode & 0o777, 0o500)
+            for file in files:
+                self.assertEqual(file.stat().st_mode & 0o777, 0o400)
+        finally:
+            for directory in directories:
+                directory.chmod(0o700)
+            for file in files:
+                file.chmod(0o600)
+
+    def test_log_follow_pipe_closure_during_initial_history_exits_zero(self):
+        self.make_log(b"x" * (4 * 1024 * 1024))
+        child = self.follow()
+        child.stdout.close()
+        self.assertEqual(child.wait(timeout=10), 0)
+        self.assertEqual(child.stderr.read(), b"")
+        child.stderr.close()
+        self.followers.remove(child)
+
+    def test_log_follow_pipe_closure_on_later_write_exits_zero(self):
+        path = self.make_log(b"start\n")
+        child = self.follow()
+        self.expect_output(child, b"start\n")
+        self.expect_no_output(child)
+        child.stdout.close()
+        with path.open("ab") as stream:
+            stream.write(b"later\n")
+        self.assertEqual(child.wait(timeout=10), 0)
+        self.assertEqual(child.stderr.read(), b"")
+        child.stderr.close()
+        self.followers.remove(child)
+
+    def test_log_without_follow_still_reports_pipe_closure(self):
+        self.make_log(b"payload\n" * 1000000)
+        child = self.spawn(["log", "web"])
+        child.stdout.close()
+        self.assertEqual(child.wait(timeout=10), 1)
+        self.assertIn(b"Broken pipe", child.stderr.read())
+        child.stderr.close()
+        self.followers.remove(child)
 
     def test_identity_mismatch_and_starting_refuse_signals(self):
         original = self.start()

@@ -33,9 +33,11 @@ static const struct {
      "Recorded IDs are historical metadata, not proof that a process is still running.\n", {NULL}},
     {"remove", "remove NAME [--force]", "Remove a command's record and log.",
      "The command must have exited. --force deletes data without stopping any processes.\n", {"rm"}},
-    {"log", "log NAME [--tail N]", "Print a command's log.",
+    {"log", "log NAME [--tail N] [-f|--follow]", "Print a command's log, optionally following new output.",
      "Print the full log by default, or the last N lines with --tail N.\n"
-     "N must be a nonnegative integer; 0 prints nothing. Output does not follow new data.\n", {"logs"}},
+     "N must be a nonnegative integer; 0 prints nothing.\n"
+     "-f/--follow keeps printing appended output until interrupted or the output closes.\n"
+     "A follow session stays with the log opened for this execution, even after the name is reused.\n", {"logs"}},
     {"help", "help [COMMAND]", "Show general or command-specific help.", "", {"-h", "--help"}},
     {"version", "version", "Show the bgx version.", "", {"-V", "--version"}},
 };
@@ -225,7 +227,34 @@ static int print_log(int fd, const uintmax_t *tail, Error *err) {
     return 0;
 }
 
-static int log_instance(const char *name, const uintmax_t *tail, Error *err) {
+static int follow_log(int fd, const uintmax_t *tail, Error *err) {
+    struct stat st;
+    if (fstat(fd, &st)) return syserr(err, "inspect log");
+    off_t start = 0;
+    if (tail && seek_tail(fd, st.st_size, *tail, &start, err)) return -1;
+    if (lseek(fd, start, SEEK_SET) < 0) return syserr(err, "seek log");
+    char buffer[32768];
+    for (;;) {
+        ssize_t n = read(fd, buffer, sizeof(buffer));
+        if (n < 0 && errno == EINTR) continue;
+        if (n < 0) return syserr(err, "read log");
+        if (n > 0) {
+            /* A closed downstream pipe completes the view without a diagnostic. */
+            if (write_all(STDOUT_FILENO, buffer, (size_t)n, err)) return errno == EPIPE ? 0 : -1;
+            continue;
+        }
+        struct timespec delay = {.tv_nsec = 200000000};
+        while (nanosleep(&delay, &delay) && errno == EINTR) {}
+        struct stat now;
+        if (fstat(fd, &now)) return syserr(err, "inspect log");
+        off_t offset = lseek(fd, 0, SEEK_CUR);
+        if (offset < 0) return syserr(err, "seek log");
+        /* Observed shrinkage means this same file was truncated; restart it. */
+        if (offset > now.st_size && lseek(fd, 0, SEEK_SET) < 0) return syserr(err, "seek log");
+    }
+}
+
+static int log_instance(const char *name, const uintmax_t *tail, bool follow, Error *err) {
     Store s;
     int opened = store_open(&s, false, err);
     if (opened < 0) return -1;
@@ -233,7 +262,7 @@ static int log_instance(const char *name, const uintmax_t *tail, Error *err) {
     int fd = store_log(&s, name, err);
     store_close(&s);
     if (fd < 0) return -1;
-    int rc = print_log(fd, tail, err);
+    int rc = follow ? follow_log(fd, tail, err) : print_log(fd, tail, err);
     close(fd);
     return rc;
 }
@@ -410,6 +439,7 @@ int main(int argc, char **argv) {
         bool force = false;
         uintmax_t tail_lines = 0;
         const uintmax_t *tail = NULL;
+        bool follow = false;
         int program_argc = 0;
         char **program_argv = NULL;
         if (!strcmp(command, "start")) {
@@ -420,24 +450,34 @@ int main(int argc, char **argv) {
             else if (argc == 4 && !strcmp(argv[3], "--force")) force = true;
             else if (argc != 3) goto syntax;
         } else if (!strcmp(command, "log")) {
-            if (argc == 5) {
-                const char *number;
-                if (!strcmp(argv[3], "--tail")) number = argv[4];
-                else if (!strcmp(argv[2], "--tail")) { number = argv[3]; name = argv[4]; }
-                else goto syntax;
-                if (!*number || strspn(number, "0123456789") != strlen(number)) {
-                    fail(&err, "--tail requires a nonnegative integer"); goto syntax;
-                }
-                errno = 0;
-                tail_lines = strtoumax(number, NULL, 10);
-                if (errno == ERANGE) { fail(&err, "--tail count is too large"); goto syntax; }
-                tail = &tail_lines;
-            } else if (argc != 3) goto syntax;
+            bool named = false, saw_tail = false, saw_follow = false;
+            for (int i = 2; i < argc; ++i) {
+                const char *argument = argv[i];
+                if (!strcmp(argument, "-f") || !strcmp(argument, "--follow")) {
+                    if (saw_follow) goto syntax;
+                    saw_follow = follow = true;
+                } else if (!strcmp(argument, "--tail")) {
+                    if (saw_tail || i + 1 >= argc) goto syntax;
+                    saw_tail = true;
+                    const char *number = argv[++i];
+                    if (!*number || strspn(number, "0123456789") != strlen(number)) {
+                        fail(&err, "--tail requires a nonnegative integer"); goto syntax;
+                    }
+                    errno = 0;
+                    tail_lines = strtoumax(number, NULL, 10);
+                    if (errno == ERANGE) { fail(&err, "--tail count is too large"); goto syntax; }
+                    tail = &tail_lines;
+                } else if (!named && argument[0] != '-') {
+                    name = argument;
+                    named = true;
+                } else goto syntax;
+            }
+            if (!named) goto syntax;
         } else if ((!strcmp(command, "stop") || !strcmp(command, "info")) && argc == 3) {
             /* Name is an argument, even if it is also a subcommand word. */
         } else goto syntax;
         if (valid_name(name, &err)) goto syntax;
-        if (!strcmp(command, "log")) rc = log_instance(name, tail, &err);
+        if (!strcmp(command, "log")) rc = log_instance(name, tail, follow, &err);
         else if (!strcmp(command, "info")) rc = info_instance(name, &err);
         else rc = mutate_instance(command, name, force, program_argc, program_argv, &err);
     }

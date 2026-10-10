@@ -11,6 +11,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - `info NAME` shows task metadata, current status and available diagnostic reasons,
   recorded process IDs, local start time, uptime, and log path without changing state.
+- `log NAME -f`/`--follow` prints existing log output and then streams appended bytes
+  from the same opened log, staying through task exit and name reuse until interrupted
+  or the output closes. `--tail N` still selects the initial lines; observed truncation
+  restarts the view from that file's beginning, and a closed output pipe exits 0.
 
 ### Changed
 
