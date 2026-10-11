@@ -33,6 +33,12 @@ static const struct {
      "Recorded IDs are historical metadata, not proof that a process is still running.\n", {NULL}},
     {"remove", "remove NAME [--force]", "Remove a command's record and log.",
      "The command must have exited. --force deletes data without stopping any processes.\n", {"rm"}},
+    {"prune", "prune [--dry-run]", "Remove records and logs for tasks that have exited.",
+     "Uses the same exit assessment as remove; running tasks are skipped silently and no\n"
+     "processes are signalled. Stale or unknown identity, unreadable records, and failed\n"
+     "deletions are reported by name and make the command exit nonzero after other\n"
+     "eligible tasks are removed.\n"
+     "--dry-run lists what would be removed without changing files or waiting on locks.\n", {NULL}},
     {"log", "log NAME [--tail N] [-f|--follow]", "Print a command's log, optionally following new output.",
      "Print the full log by default, or the last N lines with --tail N.\n"
      "N must be a nonnegative integer; 0 prints nothing.\n"
@@ -362,6 +368,95 @@ static int mutate_instance(const char *command, const char *name, bool force,
     return rc;
 }
 
+/* Per-task prune problems are named and make the batch exit nonzero without
+   stopping later candidates. */
+static void prune_name_error(const char *name, const char *message) {
+    fprintf(stderr, "bgx: %s: %s\n", name, message);
+}
+
+/* Delete one candidate under its name lock. The record is reloaded and reassessed
+   while locked so a task that started while waiting is never removed. */
+static void prune_candidate(Store *s, const char *name, size_t *removed, bool *failed) {
+    Error detail = {0};
+    int lock = store_lock(s, name, &detail);
+    if (lock < 0) { prune_name_error(name, detail.text); *failed = true; return; }
+    Record record;
+    int loaded = store_load(s, name, &record, &detail);
+    if (loaded == 1) {
+        /* Concurrent preparation/removal: the record is already gone. */
+    } else if (loaded < 0) {
+        prune_name_error(name, detail.text);
+        *failed = true;
+    } else {
+        Status state = observed(&record, &detail);
+        record_free(&record);
+        if (state == RUNNING) {
+            /* The name was reused for a running task while waiting. */
+        } else if (state != EXITED) {
+            prune_name_error(name, detail.text[0] ? detail.text : status_name(state));
+            *failed = true;
+        } else if (store_remove(s, name, &detail)) {
+            prune_name_error(name, detail.text);
+            *failed = true;
+        } else {
+            printf("Removed %s\n", name);
+            (*removed)++;
+        }
+    }
+    close(lock);
+}
+
+static int prune_instances(bool dry_run, Error *err) {
+    Store s;
+    int opened = store_open(&s, false, err);
+    if (opened < 0) return -1;
+    char **names = NULL;
+    size_t count = 0;
+    /* Enumerate fully before deleting: a partial name list must not authorize work. */
+    int rc = opened == 1 ? 0 : store_names(&s, &names, &count, err);
+    size_t removed = 0;
+    bool failed = false, locks = false;
+    for (size_t i = 0; !rc && i < count; ++i) {
+        Record record;
+        Error detail = {0};
+        int loaded = store_load(&s, names[i], &record, &detail);
+        if (loaded == 1) continue; /* Concurrent preparation/removal. */
+        if (loaded < 0) {
+            prune_name_error(names[i], detail.text);
+            failed = true;
+            continue;
+        }
+        Status state = observed(&record, &detail);
+        record_free(&record);
+        if (state == RUNNING) continue; /* Running tasks are silent, normal skips. */
+        if (state != EXITED) {
+            prune_name_error(names[i], detail.text[0] ? detail.text : status_name(state));
+            failed = true;
+            continue;
+        }
+        if (dry_run) {
+            printf("Would remove %s\n", names[i]);
+            removed++;
+            continue;
+        }
+        if (!locks) {
+            /* An existing store without a lock directory still coordinates names. */
+            if (store_open_locks(&s, err)) { rc = -1; break; }
+            locks = true;
+        }
+        bgx_test_point("prune_candidate");
+        prune_candidate(&s, names[i], &removed, &failed);
+    }
+    for (size_t i = 0; i < count; ++i) free(names[i]);
+    free(names);
+    store_close(&s);
+    if (rc) return -1;
+    printf(dry_run ? "Would remove %zu task(s).\n" : "Removed %zu task(s).\n", removed);
+    if (fflush(stdout)) return syserr(err, "write output");
+    if (failed) return fail(err, "some tasks could not be pruned");
+    return 0;
+}
+
 static int list_instances(Error *err) {
     Store s;
     int opened = store_open(&s, false, err);
@@ -434,6 +529,11 @@ int main(int argc, char **argv) {
     if (argc == 3 && is_help(argv[2])) { command_help(stdout, command); return 0; }
     int rc;
     if (argc == 2 && !strcmp(command, "list")) rc = list_instances(&err);
+    else if (!strcmp(command, "prune")) {
+        if (argc == 2) rc = prune_instances(false, &err);
+        else if (argc == 3 && !strcmp(argv[2], "--dry-run")) rc = prune_instances(true, &err);
+        else goto syntax;
+    }
     else {
         const char *name = argc > 2 ? argv[2] : "";
         bool force = false;

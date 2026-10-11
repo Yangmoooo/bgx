@@ -9,6 +9,7 @@ bgx list
 bgx log web
 bgx stop web
 bgx remove web
+bgx prune --dry-run
 ```
 
 ## Installation
@@ -36,6 +37,7 @@ Uninstall with `make uninstall PREFIX="$HOME/.local"` (use your installation pre
 | `bgx stop NAME` | Stop a task, keeping its record and log |
 | `bgx remove NAME` | Delete an exited task's record and log |
 | `bgx remove NAME --force` | Delete data only; **does not stop processes** |
+| `bgx prune [--dry-run]` | Remove records and logs for exited tasks |
 | `bgx help [COMMAND]` / `bgx version` | Show help or version |
 
 Names are case-sensitive, unique within a state directory, and contain 1–128 ASCII
@@ -63,6 +65,14 @@ environment, receive no terminal input, and combine stdout and stderr in one log
   execution when the name is reused, and restarts from the file's beginning if
   the file is observed to shrink. A closed output pipe exits 0 quietly; Ctrl-C
   stops only the viewer, not the task.
+- `prune` deletes records and logs only for tasks it assesses as exited, using the
+  same rules as `remove`; running tasks are left untouched and no processes are
+  signalled. Each name is locked and rechecked before its record is deleted, so a
+  name reused by a running task is skipped. Stale or unknown identity, unreadable
+  records, and failed deletions are reported by name, and other eligible tasks are
+  still removed before the command exits nonzero. `--dry-run` lists what would be
+  removed without changing files or waiting on name locks. An absent state
+  directory is a successful no-op.
 - Commands that change effective user, such as `sudo`, may need to be stopped
   manually before removing their records.
 - No automatic restarts, reboot recovery, interactive terminals, or final exit codes.

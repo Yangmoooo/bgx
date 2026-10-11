@@ -163,6 +163,15 @@ int store_open(Store *s, bool create, Error *err) {
     return 0;
 }
 
+/* Mutating commands that opened an existing store without create=true need the
+   lock directory before they can coordinate names. */
+int store_open_locks(Store *s, Error *err) {
+    if (s->locks >= 0) return 0;
+    if (s->root < 0) return fail(err, "state directory is not open");
+    s->locks = open_dir(s->root, "locks", true, err);
+    return s->locks < 0 ? -1 : 0;
+}
+
 void store_close(Store *s) {
     if (s->root >= 0) close(s->root);
     if (s->instances >= 0) close(s->instances);

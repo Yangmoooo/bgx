@@ -9,6 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- `prune [--dry-run]` removes records and logs only for tasks assessed as exited,
+  never signals processes, and leaves running tasks unchanged. Each name is locked
+  and rechecked before deletion; stale or unknown records, unreadable records, and
+  failed deletions are reported by name while other eligible tasks are cleaned.
+  `--dry-run` previews candidates without changing state or waiting on locks.
 - `info NAME` shows task metadata, current status and available diagnostic reasons,
   recorded process IDs, local start time, uptime, and log path without changing state.
 - `log NAME -f`/`--follow` prints existing log output and then streams appended bytes

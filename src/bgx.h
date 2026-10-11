@@ -60,6 +60,7 @@ typedef struct {
     int locks;
 } Store;
 int store_open(Store *s, bool create, Error *err); /* 1: absent */
+int store_open_locks(Store *s, Error *err); /* existing store; creates the lock directory */
 void store_close(Store *s);
 int store_lock(Store *s, const char *name, Error *err); /* owned fd or -1 */
 int store_load(Store *s, const char *name, Record *out, Error *err); /* 1: absent */

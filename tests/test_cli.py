@@ -155,6 +155,43 @@ class BgxTest(unittest.TestCase):
         self.assertEqual(err, b"")
         self.followers.remove(child)
 
+    def wait_test_point(self, child, notice, timeout=5):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if notice.exists():
+                status = subprocess.run(["ps", "-o", "stat=", "-p", str(child.pid)],
+                                        capture_output=True, timeout=1).stdout.strip()
+                if status.startswith(b"T"):
+                    return
+            if child.poll() is not None:
+                self.fail("child exited before reaching the test point")
+            time.sleep(0.005)
+        self.fail("child did not reach the test point")
+
+    def wait_for_name_lock(self, child, lock, timeout=5):
+        inode = os.fstat(lock.fileno()).st_ino
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if child.poll() is not None:
+                self.fail("child finished before its name lock was released")
+            if sys.platform == "linux":
+                # A blocked flock entry includes an arrow and the waiting PID.
+                for line in Path("/proc/locks").read_text().splitlines():
+                    fields = line.split()
+                    if (len(fields) >= 8 and fields[1:4] == ["->", "FLOCK", "ADVISORY"]
+                            and fields[5] == str(child.pid)
+                            and fields[6].endswith(f":{inode}")):
+                        return
+            else:
+                # After the checkpoint this single-threaded path has no sleeps;
+                # wait for a sleeping child rather than merely a runnable one.
+                status = subprocess.run(["ps", "-o", "stat=", "-p", str(child.pid)],
+                                        capture_output=True, timeout=1).stdout.strip()
+                if status.startswith(b"S"):
+                    return
+            time.sleep(0.005)
+        self.fail("child did not block on its name lock")
+
     def test_invalid_arguments(self):
         for args in [
             ("web", "--", "true"), ("run", "web", "--", "true"),
@@ -169,6 +206,8 @@ class BgxTest(unittest.TestCase):
             ("log", "web", "--tail", "1", "-f", "extra"),
             ("info",), ("info", "web", "extra"), ("info", "../escape"), ("info", "web", "--json"),
             ("restart", "web"), ("forget", "web"),
+            ("prune", "web"), ("prune", "--dry-run", "web"),
+            ("prune", "--dry-run", "--dry-run"), ("prune", "--force"),
             ("completion", "bash"), ("logpath", "web"),
             ("-v",), ("up", "web", "--", "true"), ("down", "web"),
         ]:
@@ -369,7 +408,7 @@ class BgxTest(unittest.TestCase):
         for args in [(), ("-h",), ("--help",)]:
             self.assertEqual(self.cli(*args).stdout, general)
         commands = {"start": ["s"], "stop": [], "list": ["ls", "ps"], "info": [], "remove": ["rm"],
-                    "log": ["logs"], "help": ["-h", "--help"], "version": ["-V", "--version"]}
+                    "prune": [], "log": ["logs"], "help": ["-h", "--help"], "version": ["-V", "--version"]}
         for command, aliases in commands.items():
             with self.subTest(command=command):
                 specific = self.cli("help", command).stdout
@@ -388,6 +427,7 @@ class BgxTest(unittest.TestCase):
         self.assertNotIn(b"bgx start", self.cli("help", "log").stdout)
         self.assertIn(b"--tail N", self.cli("help", "log").stdout)
         self.assertIn(b"--follow", self.cli("help", "log").stdout)
+        self.assertIn(b"--dry-run", self.cli("help", "prune").stdout)
         self.cli("help", "missing", expect=2)
         self.assertFalse(self.state.exists())
 
@@ -476,7 +516,7 @@ class BgxTest(unittest.TestCase):
         self.cli("rm", "web")
 
     def test_names_can_be_subcommands(self):
-        for name in ["start", "s", "stop", "list", "ls", "ps", "info", "remove", "rm", "log", "logs", "help", "version"]:
+        for name in ["start", "s", "stop", "list", "ls", "ps", "info", "remove", "rm", "prune", "log", "logs", "help", "version"]:
             self.start(name)
             self.cli("stop", name)
             self.cli("rm", name)
@@ -1054,6 +1094,273 @@ class BgxTest(unittest.TestCase):
         self.cli("stop", "web")
         os.kill(original["process_identity"]["pid"], 0)
         self.cli("rm", "--force", "missing")
+
+    def test_prune_removes_only_exited_tasks(self):
+        self.start("live")
+        self.cli("start", "done", "--", "/bin/echo", "done")
+        self.track("done")
+        self.wait_exited("done")
+        self.start("stopped")
+        self.cli("stop", "stopped")
+        live = (self.directory("live") / "meta.json").read_bytes()
+        result = self.cli("prune")
+        self.assertEqual(result.stdout, b"Removed done\nRemoved stopped\nRemoved 2 task(s).\n")
+        self.assertEqual(result.stderr, b"")
+        self.assertFalse(self.directory("done").exists())
+        self.assertFalse(self.directory("stopped").exists())
+        self.assertEqual((self.directory("live") / "meta.json").read_bytes(), live)
+        self.assertIn(b"running", self.cli("ls").stdout)
+        # Lock files coordinate naming; pruning retains them.
+        self.assertTrue((self.state / "locks" / "done.lock").exists())
+        self.assertTrue((self.state / "locks" / "stopped.lock").exists())
+        self.cli("stop", "live")
+        result = self.cli("prune")
+        self.assertEqual(result.stdout, b"Removed live\nRemoved 1 task(s).\n")
+        self.assertFalse(self.directory("live").exists())
+
+    def test_prune_dry_run_previews_without_mutation_or_locks(self):
+        import fcntl
+        self.start("live")
+        self.start("stopped")
+        self.cli("stop", "stopped")
+
+        def snapshot():
+            entries = {}
+            for path in self.state.rglob("*"):
+                entry = [path.stat().st_mode & 0o777, None]
+                if path.is_file():
+                    entry[1] = path.read_bytes()
+                entries[str(path.relative_to(self.state))] = entry
+            return entries
+
+        before = snapshot()
+        with (self.state / "locks" / "stopped.lock").open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            result = self.cli("prune", "--dry-run")
+        self.assertEqual(result.stdout, b"Would remove stopped\nWould remove 1 task(s).\n")
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(snapshot(), before)
+        # A preview neither needs nor creates the lock directory.
+        (self.state / "locks" / "live.lock").unlink()
+        (self.state / "locks" / "stopped.lock").unlink()
+        (self.state / "locks").rmdir()
+        before = snapshot()
+        result = self.cli("prune", "--dry-run")
+        self.assertEqual(result.stdout, b"Would remove stopped\nWould remove 1 task(s).\n")
+        self.assertEqual(result.stderr, b"")
+        self.assertFalse((self.state / "locks").exists())
+        self.assertEqual(snapshot(), before)
+
+    def test_prune_absent_and_empty_state_succeed_without_creation(self):
+        absent = self.base / "absent"
+        env = dict(self.env, BGX_STATE_HOME=str(absent))
+        for args, expected in [(('prune',), b"Removed 0 task(s).\n"),
+                               (('prune', '--dry-run'), b"Would remove 0 task(s).\n")]:
+            with self.subTest(args=args):
+                result = self.cli(*args, env=env)
+                self.assertEqual(result.stdout, expected)
+                self.assertEqual(result.stderr, b"")
+                self.assertFalse(absent.exists())
+        (absent / "instances").mkdir(parents=True)
+        result = self.cli("prune", env=env)
+        self.assertEqual(result.stdout, b"Removed 0 task(s).\n")
+        self.assertEqual(result.stderr, b"")
+        self.assertFalse((absent / "locks").exists())
+        self.assertEqual(list((absent / "instances").iterdir()), [])
+
+    def test_prune_creates_missing_lock_directory_for_locking(self):
+        self.start("web")
+        self.cli("stop", "web")
+        (self.state / "locks" / "web.lock").unlink()
+        (self.state / "locks").rmdir()
+        result = self.cli("prune")
+        self.assertEqual(result.stdout, b"Removed web\nRemoved 1 task(s).\n")
+        self.assertEqual(result.stderr, b"")
+        self.assertFalse(self.directory().exists())
+        self.assertEqual((self.state / "locks").stat().st_mode & 0o777, 0o700)
+
+    def test_prune_reports_damaged_and_uncertain_records_and_continues(self):
+        self.cli("start", "aaa", "--", "/bin/echo", "ok")
+        self.track("aaa")
+        self.wait_exited("aaa")
+        self.cli("start", "bbb", "--", "/bin/echo", "ok")
+        self.track("bbb")
+        self.wait_exited("bbb")
+        (self.directory("bbb") / "meta.json").write_text("{broken")
+        stale = self.start("ccc")
+        wrong = deepcopy(stale)
+        wrong["process_identity"]["start_marker"] += "-wrong"
+        self.save(wrong, "ccc")
+        pending = self.start("ddd")
+        unknown = deepcopy(pending)
+        del unknown["process_identity"]
+        unknown["starting"] = True
+        self.save(unknown, "ddd")
+        self.start("eee")
+        self.cli("stop", "eee")
+        records = {name: (self.directory(name) / "meta.json").read_bytes()
+                   for name in ["bbb", "ccc", "ddd"]}
+        result = self.cli("prune", "--dry-run", expect=1)
+        self.assertEqual(result.stdout, b"Would remove aaa\nWould remove eee\nWould remove 2 task(s).\n")
+        self.assertIn(b"bgx: bbb: invalid JSON metadata", result.stderr)
+        self.assertIn(b"bgx: ccc: process start marker does not match recorded identity", result.stderr)
+        self.assertIn(b"bgx: ddd: launch outcome has not been confirmed", result.stderr)
+        for name, contents in records.items():
+            self.assertEqual((self.directory(name) / "meta.json").read_bytes(), contents, name)
+        result = self.cli("prune", expect=1)
+        self.assertEqual(result.stdout, b"Removed aaa\nRemoved eee\nRemoved 2 task(s).\n")
+        self.assertIn(b"bgx: some tasks could not be pruned", result.stderr)
+        self.assertFalse(self.directory("aaa").exists())
+        self.assertFalse(self.directory("eee").exists())
+        for name, contents in records.items():
+            self.assertEqual((self.directory(name) / "meta.json").read_bytes(), contents, name)
+        os.kill(stale["process_identity"]["pid"], 0)
+        os.kill(pending["process_identity"]["pid"], 0)
+
+    @unittest.skipIf(os.geteuid() == 0, "requires a non-root user")
+    def test_prune_continues_after_deletion_failure(self):
+        for name in ["aaa", "bbb"]:
+            self.start(name)
+            self.cli("stop", name)
+        blocked = self.directory("aaa")
+        blocked.chmod(0o500)
+        try:
+            result = self.cli("prune", expect=1)
+            self.assertEqual(result.stdout, b"Removed bbb\nRemoved 1 task(s).\n")
+            self.assertIn(b"bgx: aaa:", result.stderr)
+            self.assertIn(b"bgx: some tasks could not be pruned", result.stderr)
+            self.assertTrue((blocked / "meta.json").exists())
+            self.assertFalse(self.directory("bbb").exists())
+        finally:
+            blocked.chmod(0o700)
+        result = self.cli("prune")
+        self.assertEqual(result.stdout, b"Removed aaa\nRemoved 1 task(s).\n")
+        self.assertFalse(blocked.exists())
+
+    def test_prune_continues_after_lock_error(self):
+        for name in ["aaa", "bbb"]:
+            self.start(name)
+            self.cli("stop", name)
+        lock = self.state / "locks" / "aaa.lock"
+        lock.unlink()
+        lock.symlink_to(self.base / "elsewhere")
+        result = self.cli("prune", expect=1)
+        self.assertEqual(result.stdout, b"Removed bbb\nRemoved 1 task(s).\n")
+        self.assertIn(b"bgx: aaa:", result.stderr)
+        self.assertIn(b"bgx: some tasks could not be pruned", result.stderr)
+        self.assertTrue(self.directory("aaa").exists())
+        self.assertFalse(self.directory("bbb").exists())
+        self.assertTrue(lock.is_symlink())
+
+    @unittest.skipIf(os.geteuid() == 0, "requires a non-root user")
+    def test_prune_reports_unreadable_record_and_continues(self):
+        for name in ["aaa", "bbb"]:
+            self.start(name)
+            self.cli("stop", name)
+        meta = self.directory("aaa") / "meta.json"
+        meta.chmod(0)
+        try:
+            result = self.cli("prune", expect=1)
+            self.assertEqual(result.stdout, b"Removed bbb\nRemoved 1 task(s).\n")
+            self.assertIn(b"bgx: aaa:", result.stderr)
+            self.assertIn(b"bgx: some tasks could not be pruned", result.stderr)
+            self.assertTrue(self.directory("aaa").exists())
+            self.assertFalse(self.directory("bbb").exists())
+        finally:
+            meta.chmod(0o600)
+
+    def test_prune_fails_safely_when_names_cannot_be_enumerated(self):
+        self.start("web")
+        self.cli("stop", "web")
+        (self.state / "instances" / "bad~name").mkdir()
+        before = (self.directory() / "meta.json").read_bytes()
+        result = self.cli("prune", expect=1)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"name must use ASCII", result.stderr)
+        self.assertEqual((self.directory() / "meta.json").read_bytes(), before)
+
+    def test_prune_uses_configured_state_root(self):
+        env = self.env.copy()
+        env.pop("BGX_STATE_HOME")
+        env["XDG_STATE_HOME"] = str(self.base / "xdg")
+        self.cli("start", "quick", "--", "/bin/echo", "ok", env=env)
+        self.cli("stop", "quick", env=env)
+        result = self.cli("prune", env=env)
+        self.assertEqual(result.stdout, b"Removed quick\nRemoved 1 task(s).\n")
+        self.assertEqual(result.stderr, b"")
+        self.assertFalse((self.base / "xdg" / "bgx" / "instances" / "quick").exists())
+        self.assertFalse(self.state.exists())
+
+    @unittest.skipUnless(os.path.exists("/dev/full"), "requires /dev/full")
+    def test_prune_output_errors_do_not_claim_success(self):
+        self.start()
+        self.cli("stop", "web")
+        with open("/dev/full", "wb") as sink:
+            result = subprocess.run([str(BINARY), "prune"], stdout=sink, stderr=subprocess.PIPE,
+                                    cwd=self.cwd, env=self.env, timeout=15)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b"write output", result.stderr)
+        self.assertNotIn(b"AddressSanitizer", result.stderr)
+        self.assertNotIn(b"runtime error:", result.stderr)
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_prune_waits_for_name_lock_and_rechecks_before_removing(self):
+        import fcntl
+        import shutil
+        self.make_log(b"exited\n")
+        notice = self.base / "prune-notice"
+        env = dict(self.env, BGX_TEST_POINT="prune_candidate", BGX_TEST_NOTIFY=str(notice))
+        lock = (self.state / "locks" / "web.lock").open("rb")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        child = subprocess.Popen([os.environ["BGX_FAULT_BIN"], "prune"], env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.followers.append(child)
+        try:
+            self.wait_test_point(child, notice)
+            # The record disappears while prune is stopped before it locks the name.
+            shutil.rmtree(self.directory())
+            os.kill(child.pid, signal.SIGCONT)
+            self.wait_for_name_lock(child, lock)
+            self.assertIsNone(child.poll())
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+        out, err = child.communicate(timeout=5)
+        self.assertEqual(child.returncode, 0, (out, err))
+        self.assertEqual(out, b"Removed 0 task(s).\n")
+        self.assertEqual(err, b"")
+        self.assertFalse(self.directory().exists())
+        self.assertTrue((self.state / "locks" / "web.lock").exists())
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_prune_skips_a_name_reused_as_running_before_locking(self):
+        self.start()
+        self.cli("stop", "web")
+        notice = self.base / "prune-notice"
+        env = dict(self.env, BGX_TEST_POINT="prune_candidate", BGX_TEST_NOTIFY=str(notice))
+        child = subprocess.Popen([os.environ["BGX_FAULT_BIN"], "prune"], env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.followers.append(child)
+        try:
+            self.wait_test_point(child, notice)
+            # Reuse the name while prune waits between assessment and locking.
+            self.cli("start", "web", "--", "/bin/sleep", "120")
+            reused = self.track()
+            before = (self.directory() / "meta.json").read_bytes()
+            os.kill(child.pid, signal.SIGCONT)
+            out, err = child.communicate(timeout=5)
+            self.assertEqual(child.returncode, 0, (out, err))
+            self.assertEqual(out, b"Removed 0 task(s).\n")
+            self.assertEqual(err, b"")
+            self.assertEqual((self.directory() / "meta.json").read_bytes(), before)
+            self.assertEqual(self.record()["process_identity"], reused["process_identity"])
+            os.kill(reused["process_identity"]["pid"], 0)
+        finally:
+            if child.poll() is None:
+                child.kill()
+                child.communicate(timeout=5)
+        self.cli("stop", "web")
+        self.cli("rm", "web")
 
     def test_invalid_metadata_is_never_reset(self):
         original = self.start()
