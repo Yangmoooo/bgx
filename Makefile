@@ -23,7 +23,7 @@ LDLIBS += -lm
 SOURCES = src/main.c src/common.c src/registry.c src/process.c src/process_$(TARGET_OS).c vendor/cjson/cJSON.c
 
 .DEFAULT_GOAL := build
-.PHONY: build debug test sanitize check release install uninstall clean FORCE
+.PHONY: build debug test test-production sanitize check release install uninstall clean FORCE
 
 build: $(BUILD)/bgx
 
@@ -46,6 +46,11 @@ FORCE:
 test: build
 	$(MAKE) BUILD=$(BUILD)/fault TESTING=1 build
 	BGX_BIN=$(abspath $(BUILD)/bgx) BGX_FAULT_BIN=$(abspath $(BUILD)/fault/bgx) $(PYTHON) -m unittest discover -s tests -v
+
+# Mirror the release-package environment, which has no fault-test binary. Any
+# test that depends on BGX_FAULT_BIN must skip instead of failing.
+test-production: build
+	env -u BGX_FAULT_BIN BGX_BIN=$(abspath $(BUILD)/bgx) $(PYTHON) -m unittest discover -s tests -v
 
 ifeq ($(TESTING),1)
 CPPFLAGS += -DBGX_TESTING -DBGX_LAUNCH_TIMEOUT_MS=500 -DBGX_CLEANUP_TIMEOUT_MS=300

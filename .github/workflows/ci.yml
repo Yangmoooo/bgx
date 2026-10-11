@@ -37,5 +37,7 @@ jobs:
           version: ${{ steps.zig.outputs.version }}
       - name: Zig target tests and native sanitizers
         run: make check
+      - name: Production-only suite
+        run: make test-production
       - name: Validate release scripts
         run: bash -n scripts/zig-cc.sh scripts/release-notes.sh scripts/package.sh
