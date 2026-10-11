@@ -1784,6 +1784,7 @@ class BgxTest(unittest.TestCase):
         self.assertEqual(self.cli("log", "web").stdout, b"recovered\n")
         self.cli("rm", "web")
 
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
     def test_restart_and_replace_refuse_recovered_first_launch(self):
         # An interrupted initial start has no confirmed definition; restart and
         # replace must refuse by name instead of acting as an implicit start.
