@@ -306,18 +306,38 @@ LaunchResult process_start(char *const argv[], int logfd, Identity *out, Error *
     close(status_pipe[0]); status_pipe[0] = -1;
     if (result == 1) {
         bgx_test_point("after_eof");
-        /* EOF alone is ambiguous. Check the kernel's exec flag while our child
-           remains unreaped, so an exit cannot cause PID reuse. Fast normal
-           exits remain valid launches (including exit 127). */
+        /* EOF alone is ambiguous: the status pipe closes both when the child
+           execs and when it exits. Confirm the exec while our child remains
+           unreaped, so an exit cannot cause PID reuse; fast normal exits
+           remain valid launches (including exit 127). Retry briefly because
+           the kernel may close the pipe before the exec flag is visible or
+           before the exit becomes observable. */
         siginfo_t info;
-        if (interrupted || child_exit_info(pid, &info, err)) {
-            if (interrupted) fail(err, "launch interrupted by signal %d", (int)interrupted);
-            goto failed;
+        memset(&info, 0, sizeof(info));
+        bool confirmed = false;
+        for (int attempt = 0; attempt < 100 && !interrupted; ++attempt) {
+            if (child_exit_info(pid, &info, err)) goto failed;
+            ProcInfo completed;
+            int inspected = platform_process(pid, &completed, err);
+            if (inspected < 0) goto failed;
+            if (inspected == 0) {
+                if (!strcmp(completed.birth, out->birth) && completed.execed) { confirmed = true; break; }
+                if (completed.execed) break; /* Birth mismatch: the PID is not our child. */
+            } else if (!platform_process_sees_zombies && info.si_pid == pid) {
+                /* The child is unreaped, so its PID cannot have been reused;
+                   platforms that cannot inspect a zombie (Darwin) report it
+                   as absent. Every pre-exec exit path reports an EXECUTE
+                   error first, so a normal exit after the EXECUTING notice
+                   proves the exec. */
+                confirmed = true;
+                break;
+            }
+            struct timespec delay = {.tv_nsec = 1000000};
+            nanosleep(&delay, NULL);
         }
-        ProcInfo completed;
-        int inspected = platform_process(pid, &completed, err);
-        if (inspected || !completed.execed || strcmp(completed.birth, out->birth)) {
-            if (inspected >= 0) fail(err, "exec completion could not be confirmed; launch outcome is uncertain");
+        if (interrupted) { fail(err, "launch interrupted by signal %d", (int)interrupted); goto failed; }
+        if (!confirmed) {
+            fail(err, "exec completion could not be confirmed; launch outcome is uncertain");
             goto failed;
         }
         if (info.si_pid == pid && info.si_code != CLD_EXITED) {

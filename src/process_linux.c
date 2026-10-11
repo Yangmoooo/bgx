@@ -8,6 +8,8 @@
 #include <string.h>
 #include <unistd.h>
 
+const bool platform_process_sees_zombies = true;
+
 int platform_boot(char out[80], Error *err) {
     int fd = open("/proc/sys/kernel/random/boot_id", O_RDONLY | O_CLOEXEC);
     if (fd < 0) return syserr(err, "read boot ID");

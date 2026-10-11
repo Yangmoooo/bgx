@@ -177,6 +177,27 @@ class HandshakeTest(unittest.TestCase):
                 self.cli("rm", "web", "--force", timeout=2)
                 self.child_pidfile.unlink()
 
+    def test_normally_exited_zombie_after_eof_confirms_exec(self):
+        # Darwin hides an unreaped zombie from proc_pidinfo, so the exec flag
+        # cannot be checked there once the target exits. The launch path must
+        # still accept a fast normal exit after the EXECUTING notice.
+        parent = self.launch("after_eof", [TRUE])
+        target = int(self.child_pidfile.read_text())
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            status = subprocess.run(["ps", "-o", "stat=", "-p", str(target)],
+                                    capture_output=True, timeout=1).stdout.strip()
+            if status.startswith(b"Z"):
+                break
+            time.sleep(0.005)
+        else:
+            self.fail("target did not become an unreaped zombie")
+        os.kill(parent, signal.SIGCONT)
+        out, err = self.child.communicate(timeout=3)
+        self.assertEqual(out, b"")
+        self.assertEqual(self.child.returncode, 0, err)
+        self.assertFalse(self.record().get("starting", False))
+
     def test_signaled_target_during_eof_observation_is_uncertain(self):
         parent = self.launch("after_eof")
         target = int(self.child_pidfile.read_text())

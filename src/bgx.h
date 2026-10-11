@@ -84,5 +84,8 @@ typedef struct { pid_t pgid; uid_t uid; bool zombie; bool execed; char birth[80]
 int platform_process(pid_t pid, ProcInfo *out, Error *err); /* 1: absent */
 int platform_boot(char out[80], Error *err);
 int platform_group_live(pid_t pgid, bool *live, Error *err);
+/* False when platform_process reports an exited but unreaped child as absent;
+   Darwin hides zombies from proc_pidinfo, Linux leaves them in /proc. */
+extern const bool platform_process_sees_zombies;
 
 #endif

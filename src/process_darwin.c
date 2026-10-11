@@ -10,6 +10,8 @@
 #include <sys/sysctl.h>
 #include <sys/time.h>
 
+const bool platform_process_sees_zombies = false;
+
 int platform_boot(char out[80], Error *err) {
     struct timeval boot;
     size_t length = sizeof(boot);
