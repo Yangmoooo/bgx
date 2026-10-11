@@ -20,21 +20,30 @@ static const struct {
     const char *details;
     const char *aliases[3];
 } commands[] = {
-    {"start", "start NAME -- PROGRAM [ARGS...]", "Start a named background command.",
-     "Names are case-sensitive and accept ASCII letters, digits, '_' and '-'.\n"
+    {"start", "start NAME -- PROGRAM [ARGS...]", "Start a new named background command.",
+     "Rejects names that already exist, even exited ones; use restart or replace for those.\n"
      "The command inherits the current directory and environment.\n"
-     "Output is logged; terminal input is disabled. Reusing an exited name deletes its old log.\n", {"s"}},
+     "Output is logged; terminal input is disabled.\n", {"s"}},
+    {"restart", "restart NAME", "Launch another execution of an existing task.",
+     "Uses the task's recorded command and directory with the current invocation's environment.\n"
+     "A running execution is stopped and confirmed ended first. The task's recorded definition\n"
+     "is unchanged; exit 0 means the new execution started.\n", {NULL}},
+    {"replace", "replace NAME -- PROGRAM [ARGS...]", "Adopt a new command for an existing task and launch it.",
+     "Uses the supplied command and the current directory and environment.\n"
+     "A running execution is stopped and confirmed ended first. The new definition is adopted\n"
+     "only when the launch succeeds.\n", {NULL}},
     {"stop", "stop NAME", "Stop a background command and its process group.",
      "Send TERM, wait up to 5 seconds, then KILL if needed. Keep the record and log.\n", {NULL}},
     {"list", "list", "List background commands and their status.",
      "Show name, status, PID, uptime, and command.\n", {"ls", "ps"}},
     {"info", "info NAME", "Show a task's record and current status.",
      "Show recorded process IDs, local start time, uptime, directory, command, and log path.\n"
-     "Recorded IDs are historical metadata, not proof that a process is still running.\n", {NULL}},
+     "Recorded IDs are historical metadata, not proof that a process is still running.\n"
+     "A pending or failed launch attempt is shown separately from the confirmed execution.\n", {NULL}},
     {"remove", "remove NAME [--force]", "Remove a command's record and log.",
      "The command must have exited. --force deletes data without stopping any processes.\n", {"rm"}},
     {"prune", "prune [--dry-run]", "Remove records and logs for tasks that have exited.",
-     "Uses the same exit assessment as remove; running tasks are skipped silently and no\n"
+     "Only tasks assessed as exited qualify; running tasks are skipped silently and no\n"
      "processes are signalled. Stale or unknown identity, unreadable records, and failed\n"
      "deletions are reported by name and make the command exit nonzero after other\n"
      "eligible tasks are removed.\n"
@@ -88,36 +97,156 @@ static void command_help(FILE *out, const char *cmd) {
 
 static bool is_help(const char *arg) { return !strcmp(arg, "--help") || !strcmp(arg, "-h"); }
 
-static Status observed(const Record *record, Error *err) {
-    if (record->starting) {
-        fail(err, "launch outcome has not been confirmed");
-        return UNKNOWN;
+/* A task's durable state: the confirmed execution (meta.json), at most one
+   latest launch attempt (attempt.json), and an optional recovery artifact
+   (recovery.json) that marks an adoption whose outcome is not final. */
+typedef struct {
+    Record meta;
+    bool has_meta;
+    Attempt attempt;
+    bool has_attempt;
+    Recovery recovery;
+    bool has_recovery;
+} Task;
+
+static void task_free(Task *task) {
+    record_free(&task->meta);
+    attempt_free(&task->attempt);
+    recovery_free(&task->recovery);
+}
+
+static int task_load(Store *s, const char *name, Task *task, Error *err) {
+    memset(task, 0, sizeof(*task));
+    int loaded = store_load_task(s, name, &task->meta, &task->has_meta, &task->attempt, &task->has_attempt,
+                                 &task->recovery, &task->has_recovery, err);
+    if (loaded < 0) { task_free(task); return -1; }
+    return loaded;
+}
+
+/* The confirmed execution for observation. While a recovery artifact exists,
+   its previous record is the confirmed execution even if meta.json already
+   names the candidate; a first launch's marker has no previous record. */
+static const Record *task_confirmed(const Task *task) {
+    if (task->has_recovery) return task->recovery.has_previous ? &task->recovery.previous : NULL;
+    return task->has_meta ? &task->meta : NULL;
+}
+
+/* A crash after finalizing a commit but before removing attempt.json leaves a
+   committing attempt naming that execution. Unresolved adoption is never
+   residue: the recovery artifact must be gone for that interpretation. */
+static bool attempt_committed_residue(const Task *task) {
+    if (task->has_recovery || !task->has_meta || !task->has_attempt) return false;
+    const Attempt *attempt = &task->attempt;
+    const Record *meta = &task->meta;
+    return attempt->state == ATTEMPT_COMMITTING &&
+           attempt->has_log && !strcmp(attempt->log, meta->log) &&
+           attempt->has_identity && meta->has_identity &&
+           attempt->identity.pid == meta->identity.pid &&
+           !strcmp(attempt->identity.birth, meta->identity.birth) &&
+           !strcmp(attempt->identity.boot, meta->identity.boot);
+}
+
+static const Attempt *task_attempt(const Task *task) {
+    return task->has_attempt && !attempt_committed_residue(task) ? &task->attempt : NULL;
+}
+
+/* Mutating-command recovery. Only provably harmless states are resolved: a
+   pre-release attempt, post-success residue, or a recovery artifact whose
+   candidate is already definitively failed. An unresolved adoption is left in
+   place for the caller to refuse. */
+static int task_recover(Store *s, const char *name, Task *task, Error *err) {
+    if (task->has_recovery) {
+        if (!task->has_attempt || task->attempt.state != ATTEMPT_FAILED) return 0;
+        if (task->recovery.has_previous) {
+            /* The candidate is definitively failed: make A the confirmed record
+               again, then retire the marker. Repeating either step is safe. */
+            if (store_save(s, &task->recovery.previous, err)) return -1;
+            if (store_remove_recovery(s, name, err)) return -1;
+            record_free(&task->meta);
+            task->meta = task->recovery.previous;
+            memset(&task->recovery.previous, 0, sizeof(task->recovery.previous));
+            task->recovery.has_previous = false;
+            task->has_meta = true;
+            task->has_recovery = false;
+            return 0;
+        }
+        /* A first launch failed definitively: its artifacts are removed. */
+        if (store_remove(s, name, err)) return -1;
+        task_free(task);
+        return 0;
     }
+    if (attempt_committed_residue(task)) {
+        if (store_discard_attempt(s, name, err)) return -1;
+        attempt_free(&task->attempt);
+        task->has_attempt = false;
+        return 0;
+    }
+    if (!task->has_attempt || task->attempt.state != ATTEMPT_PREPARED) return 0;
+    if (!task->has_meta) {
+        attempt_free(&task->attempt);
+        task->has_attempt = false;
+        return store_remove(s, name, err);
+    }
+    if (task->attempt.has_log && !strcmp(task->attempt.log, task->meta.log)) {
+        /* Damaged state that names the confirmed log: drop the record only. */
+        if (store_discard_attempt(s, name, err)) return -1;
+        attempt_free(&task->attempt);
+        task->has_attempt = false;
+        return 0;
+    }
+    if (store_remove_attempt(s, name, &task->attempt, err)) return -1;
+    attempt_free(&task->attempt);
+    task->has_attempt = false;
+    return 0;
+}
+
+static Status observed(const Record *record, Error *err) {
     if (record->exited || !record->has_identity) return EXITED;
     return process_inspect(&record->identity, err);
+}
+
+/* Effective task status. A recovery artifact means an adoption is unresolved:
+   its previous record is the confirmed execution, and the pending candidate
+   dominates until it is definitively failed. */
+static Status task_status(const Task *task, Error *err) {
+    const Attempt *attempt = task_attempt(task);
+    if (task->has_recovery) {
+        if (!task->has_attempt || (attempt && attempt->state != ATTEMPT_FAILED)) {
+            fail(err, "commit outcome has not been confirmed");
+            return UNKNOWN;
+        }
+        if (!task->recovery.has_previous) {
+            fail(err, "launch attempt has no confirmed execution");
+            return UNKNOWN;
+        }
+        return observed(&task->recovery.previous, err);
+    }
+    if (attempt) {
+        if (attempt->state == ATTEMPT_COMMITTING) {
+            fail(err, "commit outcome has not been confirmed");
+            return UNKNOWN;
+        }
+        if (attempt->state == ATTEMPT_UNCERTAIN) {
+            fail(err, "launch outcome has not been confirmed");
+            return UNKNOWN;
+        }
+        if (!task->has_meta) {
+            fail(err, attempt->state == ATTEMPT_PREPARED
+                          ? "launch was interrupted before the process started"
+                          : "launch attempt has no confirmed execution");
+            return UNKNOWN;
+        }
+    }
+    if (!task->has_meta) {
+        fail(err, "no confirmed execution");
+        return UNKNOWN;
+    }
+    return observed(&task->meta, err);
 }
 
 static int unsafe_status(const char *name, Status state, Error *err) {
     return fail(err, "%s has %s identity; inspect it or use bgx remove %s --force to delete data without stopping processes",
                 name, status_name(state), name);
-}
-
-static int init_record(Record *r, const char *name, int argc, char **argv, Error *err) {
-    memset(r, 0, sizeof(*r));
-    r->name = strdup(name);
-    r->cwd = getcwd(NULL, 0);
-    r->argv = calloc((size_t)argc + 1, sizeof(*r->argv));
-    r->starting = true;
-    r->started = time(NULL);
-    if (!r->name || !r->argv) { record_free(r); return fail(err, "out of memory"); }
-    if (!r->cwd) { record_free(r); return syserr(err, "get working directory"); }
-    if (r->started < 0) { record_free(r); return fail(err, "cannot read current time"); }
-    for (int i = 0; i < argc; ++i) {
-        r->argv[r->argc] = strdup(argv[i]);
-        if (!r->argv[r->argc]) { record_free(r); return fail(err, "out of memory"); }
-        r->argc++;
-    }
-    return 0;
 }
 
 static int cleanup_launch(Store *s, const char *name, Error *err) {
@@ -129,59 +258,318 @@ static int cleanup_launch(Store *s, const char *name, Error *err) {
     return -1;
 }
 
-static int start_locked(Store *s, const char *name, int argc, char **argv, Error *err) {
-    Record old;
-    int loaded = store_load(s, name, &old, err);
-    if (loaded < 0) return -1;
-    if (!loaded) {
-        Status state = observed(&old, err);
-        record_free(&old);
-        if (state == RUNNING) return fail(err, "%s is running; use bgx stop %s first", name, name);
-        if (state != EXITED) return unsafe_status(name, state, err);
+typedef struct {
+    Store *store;
+    const Attempt *attempt;
+} ReleaseContext;
+
+/* Runs inside process_start before the candidate may exec. */
+static int persist_release(void *context, const Identity *identity, Error *err) {
+    ReleaseContext *release = context;
+    Attempt released = *release->attempt;
+    released.has_identity = true;
+    released.identity = *identity;
+    released.state = ATTEMPT_UNCERTAIN;
+    return store_save_attempt(release->store, &released, err);
+}
+
+/* Abort a released candidate after adoption failed. Returns true when cleanup
+   is confirmed; otherwise appends the cleanup failure so the caller can record
+   visible uncertainty. */
+static bool abort_candidate(const Identity *identity, Error *err) {
+    Error stop_error = {0};
+    if (!process_abort_launch(identity, &stop_error)) return true;
+    append_error(err, "; cleanup PID %ld failed: %.140s", (long)identity->pid, stop_error.text);
+    return false;
+}
+
+static void mark_attempt_uncertain(Store *s, Attempt *attempt, const char *cause, Error *err) {
+    attempt->state = ATTEMPT_UNCERTAIN;
+    snprintf(attempt->error, sizeof(attempt->error), "%.450s", cause);
+    Error stored = {0};
+    int saved = bgx_test_fault("uncertain_failure")
+                    ? fail(&stored, "injected uncertain attempt write failure")
+                    : store_save_attempt(s, attempt, &stored);
+    if (saved) append_error(err, "; could not persist uncertain attempt: %.120s", stored.text);
+}
+
+/* Persist a definitively failed attempt (no candidate processes remain) and
+   report its retained output when there is any. */
+static void finalize_failed_attempt(Store *s, const char *name, Attempt *attempt, const char *cause, Error *err) {
+    attempt->state = ATTEMPT_FAILED;
+    snprintf(attempt->error, sizeof(attempt->error), "%.450s", cause);
+    Error stored = {0};
+    if (store_finalize_failed_attempt(s, name, attempt, &stored))
+        append_error(err, "; could not persist attempt diagnostics: %.120s", stored.text);
+    if (attempt->has_log) {
+        Error ignored = {0};
+        char *path = store_log_path(s, name, attempt->log, &ignored);
+        if (path) {
+            append_error(err, "; attempt log: %.180s", path);
+            free(path);
+        }
     }
-    Record record;
-    if (init_record(&record, name, argc, argv, err)) return -1;
-    if (store_remove(s, name, err)) { record_free(&record); return -1; }
-    int logfd = store_prepare(s, name, err);
-    if (logfd < 0) {
-        record_free(&record);
-        return cleanup_launch(s, name, err);
+}
+
+/* Adoption failed before the publishing rename: meta.json still holds A, so a
+   recovery marker is stale and no durable A copy is needed. */
+static int fail_before_publication(Store *s, const char *name, const Record *confirmed, Attempt *attempt,
+                                   const char *cause, Error *err) {
+    if (abort_candidate(&attempt->identity, err)) {
+        if (confirmed) finalize_failed_attempt(s, name, attempt, cause, err);
+        else cleanup_launch(s, name, err);
+    } else {
+        mark_attempt_uncertain(s, attempt, cause, err);
     }
-    if (store_save(s, &record, err)) {
-        close(logfd); record_free(&record);
-        return cleanup_launch(s, name, err);
+    Error ignored = {0};
+    store_remove_recovery(s, name, &ignored);
+    return -1;
+}
+
+/* Adoption failed after the publishing rename may have taken effect: meta.json
+   can already name B, while recovery.json holds A. Keep A durable and visible
+   until the outcome is resolved; restore it only after confirmed cleanup. */
+static int fail_after_publication(Store *s, const char *name, const Record *confirmed, Attempt *attempt,
+                                  const char *cause, Error *err) {
+    if (abort_candidate(&attempt->identity, err)) {
+        if (confirmed) {
+            /* Persist B failed first: a crash then leaves a state a later
+               command can finish resolving without a live candidate. */
+            finalize_failed_attempt(s, name, attempt, cause, err);
+            bgx_test_point("adoption_failed");
+            Error restore_error = {0};
+            int restored = bgx_test_fault("restore_failure")
+                               ? fail(&restore_error, "injected confirmed-record restore failure")
+                               : store_save(s, confirmed, &restore_error);
+            if (restored) {
+                append_error(err, "; could not restore confirmed record: %.120s", restore_error.text);
+                return -1; /* recovery.json keeps A visible */
+            }
+            Error ignored = {0};
+            store_remove_recovery(s, name, &ignored);
+        } else {
+            cleanup_launch(s, name, err);
+        }
+    } else {
+        /* Candidate may live: leave recovery.json in place so A stays the
+           durable confirmed record and the unresolved state stays unknown. */
+        mark_attempt_uncertain(s, attempt, cause, err);
     }
-    LaunchResult launch = process_start(record.argv, logfd, &record.identity, err);
+    return -1;
+}
+
+/* Prepare, launch, and commit one execution. confirmed is the task's current
+   confirmed record, or NULL when the name had no execution yet. On success the
+   attempt becomes the confirmed record; on failure the confirmed record, if
+   any, is preserved and the attempt is retained only as diagnostics. */
+static int launch_task(Store *s, const char *name, const Record *confirmed, char **argv, int argc,
+                       const char *cwd, int cwdfd, Error *err) {
+    Attempt attempt = {0};
+    attempt.name = strdup(name);
+    attempt.cwd = strdup(cwd);
+    attempt.started = time(NULL);
+    attempt.argv = calloc((size_t)argc + 1, sizeof(*attempt.argv));
+    attempt.state = ATTEMPT_PREPARED;
+    if (!attempt.name || !attempt.cwd || !attempt.argv) { attempt_free(&attempt); return fail(err, "out of memory"); }
+    if (attempt.started < 0) { attempt_free(&attempt); return fail(err, "cannot read current time"); }
+    for (int i = 0; i < argc; ++i) {
+        attempt.argv[attempt.argc] = strdup(argv[i]);
+        if (!attempt.argv[attempt.argc]) { attempt_free(&attempt); return fail(err, "out of memory"); }
+        attempt.argc++;
+    }
+    int rc = -1;
+    int logfd = store_prepare_attempt(s, name, attempt.log, err);
+    if (logfd < 0) goto done;
+    attempt.has_log = true;
+    if (store_save_attempt(s, &attempt, err)) { close(logfd); goto done; }
+    /* The attempt supersedes any earlier failed one; its now-unreferenced
+       diagnostics are residue. */
+    {
+        Error ignored = {0};
+        store_cleanup(s, name, &ignored);
+    }
+    bgx_test_point("attempt_prepared");
+    ReleaseContext release = {s, &attempt};
+    Identity identity = {0};
+    LaunchResult launch = process_start(attempt.argv, logfd, cwdfd, persist_release, &release, &identity, err);
     close(logfd);
-    if (launch != LAUNCH_OK) {
-        record_free(&record);
-        if (launch == LAUNCH_UNCERTAIN) return -1; /* Keep the durable starting marker. */
-        return cleanup_launch(s, name, err);
+    if (identity.pid > 0) {
+        attempt.has_identity = true;
+        attempt.identity = identity;
     }
-    record.starting = false;
-    record.has_identity = true;
-    bgx_test_point("before_commit");
-    int rc = bgx_test_fault("save_identity") ? fail(err, "injected metadata write failure") : store_save(s, &record, err);
-    if (rc) {
-        Error stop_error = {0};
-        if (process_abort_launch(&record.identity, &stop_error)) {
-            size_t used = strlen(err->text);
-            snprintf(err->text + used, sizeof(err->text) - used,
-                     "; cleanup PID %ld failed: %.140s", (long)record.identity.pid, stop_error.text);
-        } else cleanup_launch(s, name, err);
+    if (launch == LAUNCH_OK) {
+        bgx_test_point("before_commit");
+        /* Adoption becomes possible here: record that a commit may replace the
+           confirmed record before the publishing rename, so an interrupted
+           commit is never read as an untouched task. */
+        attempt.state = ATTEMPT_COMMITTING;
+        Error marker = {0};
+        int marked = bgx_test_fault("commit_marker_failure")
+                         ? fail(&marker, "injected commit evidence write failure")
+                         : store_save_attempt(s, &attempt, &marker);
+        if (marked) {
+            /* The marker failure is the cause; do not leak a stale message from
+               an earlier read into the invocation diagnostics. */
+            *err = marker;
+            rc = fail_before_publication(s, name, confirmed, &attempt, marker.text, err);
+            goto done;
+        }
+        /* Bounded recovery artifact: while it exists the adoption is unresolved
+           and its previous record is the confirmed execution for reads. */
+        Recovery recovery = {0};
+        if (confirmed) {
+            recovery.has_previous = true;
+            recovery.previous = *confirmed; /* shallow: temporary view only */
+        }
+        int saved_recovery = bgx_test_fault("recovery_failure")
+                                 ? fail(err, "injected recovery evidence write failure")
+                                 : store_save_recovery(s, name, &recovery, err);
+        if (saved_recovery) {
+            Error cause = *err;
+            rc = fail_before_publication(s, name, confirmed, &attempt, cause.text, err);
+            goto done;
+        }
+        bgx_test_point("before_publication");
+        bool published = false;
+        int committed = bgx_test_fault("save_identity")
+                            ? fail(err, "injected metadata write failure")
+                            : store_commit_attempt(s, name, &attempt, &published, err);
+        if (committed) {
+            Error cause = *err;
+            rc = published ? fail_after_publication(s, name, confirmed, &attempt, cause.text, err)
+                           : fail_before_publication(s, name, confirmed, &attempt, cause.text, err);
+            goto done;
+        }
+        /* Publication and its directory syncs succeeded. Removing the recovery
+           marker is the adoption success point: only after it does meta.json
+           alone describe the confirmed execution. */
+        int finalized = bgx_test_fault("remove_recovery_failure")
+                            ? fail(err, "injected recovery removal failure")
+                            : store_remove_recovery(s, name, err);
+        if (finalized) {
+            Error cause = *err;
+            rc = fail_after_publication(s, name, confirmed, &attempt, cause.text, err);
+            goto done;
+        }
+        bgx_test_point("commit_finalized");
+        store_cleanup_committed(s, name, &attempt, confirmed ? confirmed->log : NULL);
+        rc = 0;
+        goto done;
     }
-    record_free(&record);
+    if (launch == LAUNCH_UNCERTAIN) {
+        Error cause = *err;
+        attempt.state = ATTEMPT_UNCERTAIN;
+        snprintf(attempt.error, sizeof(attempt.error), "%.450s", cause.text);
+        Error stored = {0};
+        if (store_save_attempt(s, &attempt, &stored))
+            append_error(err, "; could not persist launch evidence: %.120s", stored.text);
+        goto done;
+    }
+    /* Definite failure: the candidate never ran and its cleanup is confirmed. */
+    if (!confirmed) {
+        rc = cleanup_launch(s, name, err);
+        goto done;
+    }
+    finalize_failed_attempt(s, name, &attempt, err->text, err);
+    goto done;
+done:
+    attempt_free(&attempt);
     return rc;
 }
 
-static int stop_locked(Store *s, const char *name, Record *r, Error *err) {
-    Status state = observed(r, err);
+static int start_locked(Store *s, const char *name, Task *task, int argc, char **argv, Error *err) {
+    if (task_recover(s, name, task, err)) return -1;
+    if (task->has_recovery) return unsafe_status(name, UNKNOWN, err);
+    if (task->has_meta)
+        return fail(err, "%s already exists; use bgx restart %s or bgx replace %s -- PROGRAM to run it again",
+                    name, name, name);
+    if (task->has_attempt) return unsafe_status(name, UNKNOWN, err);
+    char *cwd = getcwd(NULL, 0);
+    if (!cwd) return syserr(err, "get working directory");
+    int rc = launch_task(s, name, NULL, argv, argc, cwd, -1, err);
+    free(cwd);
+    return rc;
+}
+
+/* restart and replace share preparation, stop, launch, and commit. */
+static int relaunch_locked(Store *s, const char *name, Task *task, bool replace,
+                           int program_argc, char **program_argv, Error *err) {
+    if (task_recover(s, name, task, err)) return -1;
+    if (task->has_recovery) return unsafe_status(name, UNKNOWN, err);
+    if (task->has_attempt && task->attempt.state != ATTEMPT_FAILED) return unsafe_status(name, UNKNOWN, err);
+    /* Recovery may have removed a first launch that never had a confirmed
+       execution; restart/replace must not become an implicit start. */
+    if (!task->has_meta)
+        return fail(err, "%s has no confirmed execution; use bgx start %s -- PROGRAM", name, name);
+    char *cwd = NULL;
+    int cwdfd = -1;
+    char **argv = program_argv;
+    int argc = program_argc;
+    if (replace) {
+        cwd = getcwd(NULL, 0);
+        if (!cwd) return syserr(err, "get working directory");
+    } else {
+        argv = task->meta.argv;
+        argc = (int)task->meta.argc;
+        /* Reliable prerequisite: the recorded directory must still be usable
+           before a running execution is stopped. */
+        cwdfd = open(task->meta.cwd, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        if (cwdfd < 0) {
+            Error detail = {0};
+            syserr(&detail, "open recorded directory");
+            return fail(err, "cannot start in recorded directory %s: %.380s", task->meta.cwd, detail.text);
+        }
+        cwd = strdup(task->meta.cwd);
+        if (!cwd) { close(cwdfd); return fail(err, "out of memory"); }
+    }
+    Status state = observed(&task->meta, err);
     if (state == RUNNING) {
-        if (process_stop(&r->identity, err)) return -1;
+        if (process_stop(&task->meta.identity, err)) goto fail;
+        task->meta.exited = true;
+        if (store_save(s, &task->meta, err)) goto fail;
+    } else if (state == EXITED) {
+        /* Confirmed completion becomes durable before any candidate may fail,
+           preserving identity and the rest of the historical record. */
+        if (!task->meta.exited) {
+            task->meta.exited = true;
+            if (store_save(s, &task->meta, err)) goto fail;
+        }
+    } else {
+        unsafe_status(name, state, err);
+        goto fail;
+    }
+    int rc = launch_task(s, name, &task->meta, argv, argc, cwd, cwdfd, err);
+    close(cwdfd);
+    free(cwd);
+    return rc;
+fail:
+    if (cwdfd >= 0) close(cwdfd);
+    free(cwd);
+    return -1;
+}
+
+static int stop_locked(Store *s, const char *name, Task *task, Error *err) {
+    if (task_recover(s, name, task, err)) return -1;
+    if (task->has_recovery) return unsafe_status(name, UNKNOWN, err);
+    if (task->has_attempt && task->attempt.state != ATTEMPT_FAILED) return unsafe_status(name, UNKNOWN, err);
+    if (!task->has_meta) return fail(err, "instance not found: %s", name);
+    Status state = observed(&task->meta, err);
+    if (state == RUNNING) {
+        if (process_stop(&task->meta.identity, err)) return -1;
     } else if (state != EXITED) return unsafe_status(name, state, err);
-    if (r->exited) return 0;
-    r->exited = true;
-    return store_save(s, r, err);
+    if (task->meta.exited) return 0;
+    task->meta.exited = true;
+    return store_save(s, &task->meta, err);
+}
+
+static int remove_locked(Store *s, const char *name, Task *task, Error *err) {
+    if (task_recover(s, name, task, err)) return -1;
+    if (!task->has_meta && !task->has_attempt && !task->has_recovery)
+        return fail(err, "instance not found: %s", name);
+    Status state = task_status(task, err);
+    if (state == RUNNING) return fail(err, "%s is running; stop it before removing", name);
+    if (state != EXITED) return unsafe_status(name, state, err);
+    return store_remove(s, name, err);
 }
 
 static int seek_tail(int fd, off_t end, uintmax_t lines, off_t *start, Error *err) {
@@ -275,30 +663,42 @@ static int log_instance(const char *name, const uintmax_t *tail, bool follow, Er
 
 static void info_value(const char *label, const char *value) {
     printf("%-14s ", label);
-    print_arg(stdout, value);
+    if (value) print_arg(stdout, value);
+    else fputc('-', stdout);
     fputc('\n', stdout);
 }
 
-static int print_info(const Record *record, const char *log_path, Error *err) {
-    struct tm local;
-    char started[64];
-    if (!localtime_r(&record->started, &local) ||
-        !strftime(started, sizeof(started), "%Y-%m-%d %H:%M:%S %z", &local))
-        return fail(err, "cannot format local start time");
+static void info_argv(const char *label, const char *const *argv, size_t argc) {
+    printf("%-14s ", label);
+    for (size_t i = 0; i < argc; ++i) {
+        if (i) fputc(' ', stdout);
+        print_arg(stdout, argv[i]);
+    }
+    fputc('\n', stdout);
+}
+
+static int print_info(const char *name, const Task *task, const char *log_path, const char *attempt_log_path, Error *err) {
     Error observation = {0};
-    Status state = observed(record, &observation);
-    char pid[32] = "-", pgid[32] = "-", uptime[32] = "-";
-    if (record->has_identity) {
-        snprintf(pid, sizeof(pid), "%ld", (long)record->identity.pid);
-        snprintf(pgid, sizeof(pgid), "%ld", (long)record->identity.pgid);
+    Status state = task_status(task, &observation);
+    const Record *confirmed = task_confirmed(task);
+    char pid[32] = "-", pgid[32] = "-", uptime[32] = "-", started[64] = "-";
+    if (confirmed) {
+        struct tm local;
+        if (!localtime_r(&confirmed->started, &local) ||
+            !strftime(started, sizeof(started), "%Y-%m-%d %H:%M:%S %z", &local))
+            return fail(err, "cannot format local start time");
+        if (confirmed->has_identity) {
+            snprintf(pid, sizeof(pid), "%ld", (long)confirmed->identity.pid);
+            snprintf(pgid, sizeof(pgid), "%ld", (long)confirmed->identity.pgid);
+        }
+        if (state == RUNNING) {
+            time_t now = time(NULL);
+            long long seconds = now > confirmed->started ? (long long)(now - confirmed->started) : 0;
+            snprintf(uptime, sizeof(uptime), "%02lld:%02lld:%02lld",
+                     seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+        }
     }
-    if (state == RUNNING) {
-        time_t now = time(NULL);
-        long long seconds = now > record->started ? (long long)(now - record->started) : 0;
-        snprintf(uptime, sizeof(uptime), "%02lld:%02lld:%02lld",
-                 seconds / 3600, (seconds % 3600) / 60, seconds % 60);
-    }
-    printf("%-14s %s\n", "Name:", record->name);
+    printf("%-14s %s\n", "Name:", confirmed ? confirmed->name : name);
     printf("%-14s %s\n", "Status:", status_name(state));
     if ((state == STALE || state == UNKNOWN) && observation.text[0])
         printf("%-14s %s\n", "Reason:", observation.text);
@@ -306,14 +706,37 @@ static int print_info(const Record *record, const char *log_path, Error *err) {
     printf("%-14s %s\n", "Recorded PGID:", pgid);
     printf("%-14s %s\n", "Started:", started);
     printf("%-14s %s\n", "Uptime:", uptime);
-    info_value("Directory:", record->cwd);
-    printf("%-14s ", "Command:");
-    for (size_t i = 0; i < record->argc; ++i) {
-        if (i) fputc(' ', stdout);
-        print_arg(stdout, record->argv[i]);
-    }
-    fputc('\n', stdout);
+    info_value("Directory:", confirmed ? confirmed->cwd : NULL);
+    info_argv("Command:", confirmed ? (const char *const *)confirmed->argv : NULL,
+              confirmed ? confirmed->argc : 0);
     info_value("Log:", log_path);
+    const Attempt *display = task_attempt(task);
+    if (display) {
+        const Attempt *attempt = display;
+        if (attempt->state == ATTEMPT_FAILED) {
+            info_argv("Failed command:", (const char *const *)attempt->argv, attempt->argc);
+            info_value("Failed directory:", attempt->cwd);
+            if (attempt->has_identity) {
+                char apid[32], apgid[32];
+                snprintf(apid, sizeof(apid), "%ld", (long)attempt->identity.pid);
+                snprintf(apgid, sizeof(apgid), "%ld", (long)attempt->identity.pgid);
+                printf("%-14s %s\n", "Failed PID:", apid);
+                printf("%-14s %s\n", "Failed PGID:", apgid);
+            }
+        } else {
+            info_argv("Pending command:", (const char *const *)attempt->argv, attempt->argc);
+            info_value("Pending directory:", attempt->cwd);
+            char apid[32] = "-", apgid[32] = "-";
+            if (attempt->has_identity) {
+                snprintf(apid, sizeof(apid), "%ld", (long)attempt->identity.pid);
+                snprintf(apgid, sizeof(apgid), "%ld", (long)attempt->identity.pgid);
+            }
+            printf("%-14s %s\n", "Pending PID:", apid);
+            printf("%-14s %s\n", "Pending PGID:", apgid);
+        }
+        if (attempt->error[0]) info_value("Attempt error:", attempt->error);
+        if (attempt_log_path) info_value("Attempt log:", attempt_log_path);
+    }
     return fflush(stdout) ? syserr(err, "write output") : 0;
 }
 
@@ -322,47 +745,58 @@ static int info_instance(const char *name, Error *err) {
     int opened = store_open(&s, false, err);
     if (opened < 0) return -1;
     if (opened == 1) return fail(err, "instance not found: %s", name);
-    Record record;
-    int loaded = store_load(&s, name, &record, err);
-    char *log_path = loaded ? NULL : store_log_path(&s, name, err);
+    Task task;
+    int loaded = task_load(&s, name, &task, err);
+    char *log_path = NULL, *attempt_log_path = NULL;
+    bool path_error = false;
+    if (!loaded) {
+        const Attempt *attempt = task_attempt(&task);
+        const Record *confirmed = task_confirmed(&task);
+        /* While adoption is unresolved the confirmed log is the previous
+           execution's log, not meta.json's candidate log. */
+        const char *current = confirmed ? confirmed->log
+                           : (attempt && attempt->has_log ? attempt->log : NULL);
+        if (current && !(log_path = store_log_path(&s, name, current, err))) path_error = true;
+        if (!path_error && confirmed && attempt && attempt->has_log &&
+            !(attempt_log_path = store_log_path(&s, name, attempt->log, err)))
+            path_error = true;
+    }
     store_close(&s);
     int rc = -1;
     if (loaded == 1) fail(err, "instance not found: %s", name);
     else if (loaded < 0) {
         Error cause = *err;
         fail(err, "%s: %.360s", name, cause.text);
-    } else if (log_path) rc = print_info(&record, log_path, err);
+    } else if (!path_error) rc = print_info(name, &task, log_path, attempt_log_path, err);
+    task_free(&task);
     free(log_path);
-    record_free(&record);
+    free(attempt_log_path);
     return rc;
 }
 
 static int mutate_instance(const char *command, const char *name, bool force,
-                           int argc, char **argv, Error *err) {
+                           int program_argc, char **program_argv, Error *err) {
     Store s;
     if (store_open(&s, true, err)) return -1;
+    bgx_test_point("before_name_lock");
     int lock = store_lock(&s, name, err);
     if (lock < 0) { store_close(&s); return -1; }
     int rc = -1;
-    Record record = {0};
-    if (!strcmp(command, "start")) rc = start_locked(&s, name, argc, argv, err);
-    else if (!strcmp(command, "remove") && force) {
+    if (!strcmp(command, "remove") && force) {
         fputs("bgx: --force deletes the record and log only; no processes will be stopped; old processes may still be running.\n", stderr);
         rc = store_remove(&s, name, err);
     } else {
-        int loaded = store_load(&s, name, &record, err);
-        if (loaded == 1) fail(err, "instance not found: %s", name);
-        if (!loaded) {
-            if (!strcmp(command, "stop")) rc = stop_locked(&s, name, &record, err);
-            else if (!strcmp(command, "remove")) {
-                Status state = observed(&record, err);
-                if (state == EXITED) rc = store_remove(&s, name, err);
-                else if (state == RUNNING) fail(err, "%s is running; stop it before removing", name);
-                else unsafe_status(name, state, err);
-            }
-        }
+        Task task;
+        int loaded = task_load(&s, name, &task, err);
+        if (loaded < 0) rc = -1;
+        else if (!strcmp(command, "start")) rc = start_locked(&s, name, &task, program_argc, program_argv, err);
+        else if (loaded == 1) fail(err, "instance not found: %s", name);
+        else if (!strcmp(command, "stop")) rc = stop_locked(&s, name, &task, err);
+        else if (!strcmp(command, "restart")) rc = relaunch_locked(&s, name, &task, false, 0, NULL, err);
+        else if (!strcmp(command, "replace")) rc = relaunch_locked(&s, name, &task, true, program_argc, program_argv, err);
+        else if (!strcmp(command, "remove")) rc = remove_locked(&s, name, &task, err);
+        task_free(&task);
     }
-    record_free(&record);
     close(lock);
     store_close(&s);
     return rc;
@@ -380,16 +814,15 @@ static void prune_candidate(Store *s, const char *name, size_t *removed, bool *f
     Error detail = {0};
     int lock = store_lock(s, name, &detail);
     if (lock < 0) { prune_name_error(name, detail.text); *failed = true; return; }
-    Record record;
-    int loaded = store_load(s, name, &record, &detail);
+    Task task;
+    int loaded = task_load(s, name, &task, &detail);
     if (loaded == 1) {
         /* Concurrent preparation/removal: the record is already gone. */
     } else if (loaded < 0) {
         prune_name_error(name, detail.text);
         *failed = true;
     } else {
-        Status state = observed(&record, &detail);
-        record_free(&record);
+        Status state = task_status(&task, &detail);
         if (state == RUNNING) {
             /* The name was reused for a running task while waiting. */
         } else if (state != EXITED) {
@@ -402,6 +835,7 @@ static void prune_candidate(Store *s, const char *name, size_t *removed, bool *f
             printf("Removed %s\n", name);
             (*removed)++;
         }
+        task_free(&task);
     }
     close(lock);
 }
@@ -417,17 +851,17 @@ static int prune_instances(bool dry_run, Error *err) {
     size_t removed = 0;
     bool failed = false, locks = false;
     for (size_t i = 0; !rc && i < count; ++i) {
-        Record record;
+        Task task;
         Error detail = {0};
-        int loaded = store_load(&s, names[i], &record, &detail);
+        int loaded = task_load(&s, names[i], &task, &detail);
         if (loaded == 1) continue; /* Concurrent preparation/removal. */
         if (loaded < 0) {
             prune_name_error(names[i], detail.text);
             failed = true;
             continue;
         }
-        Status state = observed(&record, &detail);
-        record_free(&record);
+        Status state = task_status(&task, &detail);
+        task_free(&task);
         if (state == RUNNING) continue; /* Running tasks are silent, normal skips. */
         if (state != EXITED) {
             prune_name_error(names[i], detail.text[0] ? detail.text : status_name(state));
@@ -468,9 +902,9 @@ static int list_instances(Error *err) {
     int rc = store_names(&s, &names, &count, err);
     bool incomplete = false;
     for (size_t i = 0; !rc && i < count; ++i) {
-        Record record;
+        Task task;
         Error load_error = {0};
-        int loaded = store_load(&s, names[i], &record, &load_error);
+        int loaded = task_load(&s, names[i], &task, &load_error);
         if (loaded == 1) continue; /* Concurrent preparation/removal. */
         if (loaded < 0) {
             printf("%-24s %-9s %-8s %-9s %s\n", names[i], status_name(UNKNOWN), "-", "-", "-");
@@ -479,22 +913,37 @@ static int list_instances(Error *err) {
             continue;
         }
         Error inspect_error = {0};
-        Status state = observed(&record, &inspect_error);
+        Status state = task_status(&task, &inspect_error);
+        const Attempt *attempt = task_attempt(&task);
+        const Record *confirmed = task_confirmed(&task);
+        const char *const *argv = NULL;
+        size_t argc = 0;
+        if (attempt && attempt->state != ATTEMPT_FAILED) {
+            /* A possible new process must not be labelled with the old command. */
+            argv = (const char *const *)attempt->argv;
+            argc = attempt->argc;
+        } else if (confirmed) {
+            argv = (const char *const *)confirmed->argv;
+            argc = confirmed->argc;
+        } else if (task.has_attempt) {
+            argv = (const char *const *)task.attempt.argv;
+            argc = task.attempt.argc;
+        }
         char pid[32] = "-", uptime[32] = "-";
-        if (state == RUNNING) {
-            snprintf(pid, sizeof(pid), "%ld", (long)record.identity.pid);
+        if (state == RUNNING && confirmed && confirmed->has_identity) {
+            snprintf(pid, sizeof(pid), "%ld", (long)confirmed->identity.pid);
             time_t now = time(NULL);
-            long long seconds = now > record.started ? (long long)(now - record.started) : 0;
+            long long seconds = now > confirmed->started ? (long long)(now - confirmed->started) : 0;
             snprintf(uptime, sizeof(uptime), "%02lld:%02lld:%02lld",
                      seconds / 3600, (seconds % 3600) / 60, seconds % 60);
         }
-        printf("%-24s %-9s %-8s %-9s ", record.name, status_name(state), pid, uptime);
-        for (size_t j = 0; j < record.argc; ++j) {
+        printf("%-24s %-9s %-8s %-9s ", names[i], status_name(state), pid, uptime);
+        for (size_t j = 0; j < argc; ++j) {
             if (j) fputc(' ', stdout);
-            print_arg(stdout, record.argv[j]);
+            print_arg(stdout, argv[j]);
         }
         fputc('\n', stdout);
-        record_free(&record);
+        task_free(&task);
     }
     for (size_t i = 0; i < count; ++i) free(names[i]);
     free(names);
@@ -542,9 +991,11 @@ int main(int argc, char **argv) {
         bool follow = false;
         int program_argc = 0;
         char **program_argv = NULL;
-        if (!strcmp(command, "start")) {
+        if (!strcmp(command, "start") || !strcmp(command, "replace")) {
             if (argc < 5 || strcmp(argv[3], "--") || !*argv[4]) goto syntax;
             program_argc = argc - 4; program_argv = argv + 4;
+        } else if (!strcmp(command, "restart")) {
+            if (argc != 3) goto syntax;
         } else if (!strcmp(command, "remove")) {
             if (argc == 4 && !strcmp(argv[2], "--force")) { force = true; name = argv[3]; }
             else if (argc == 4 && !strcmp(argv[3], "--force")) force = true;

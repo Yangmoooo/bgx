@@ -23,6 +23,15 @@ int syserr(Error *err, const char *what) {
     return rc;
 }
 
+void append_error(Error *err, const char *fmt, ...) {
+    size_t used = strlen(err->text);
+    if (used >= sizeof(err->text) - 1) return;
+    va_list ap;
+    va_start(ap, fmt);
+    vsnprintf(err->text + used, sizeof(err->text) - used, fmt, ap);
+    va_end(ap);
+}
+
 char *join_path(const char *a, const char *b, Error *err) {
     size_t na = strlen(a), nb = strlen(b);
     if (na > SIZE_MAX - nb - 2) { fail(err, "path too long"); return NULL; }

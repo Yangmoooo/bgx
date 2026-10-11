@@ -23,7 +23,7 @@ const char *status_name(Status status) {
 }
 
 typedef struct { int stage; int error; } LaunchMessage;
-enum { READY, SESSION, REDIRECT, EXECUTING, EXECUTE };
+enum { READY, SESSION, REDIRECT, CHDIR, EXECUTING, EXECUTE };
 
 #ifndef BGX_LAUNCH_TIMEOUT_MS
 #define BGX_LAUNCH_TIMEOUT_MS 5000
@@ -197,7 +197,8 @@ int process_abort_launch(const Identity *id, Error *err) {
     return cleanup_child(id->pid, true, err) ? 0 : -1;
 }
 
-LaunchResult process_start(char *const argv[], int logfd, Identity *out, Error *err) {
+LaunchResult process_start(char *const argv[], int logfd, int cwdfd, ReleaseGuard guard, void *guard_context,
+                           Identity *out, Error *err) {
     int status_pipe[2] = {-1, -1}, gate[2] = {-1, -1};
     pid_t pid = -1;
     bool released = false, definite_failure = false;
@@ -231,6 +232,7 @@ LaunchResult process_start(char *const argv[], int logfd, Identity *out, Error *
         close(status_pipe[0]); close(gate[1]);
         bgx_test_point("before_ready");
         if (setsid() < 0) { child_report(status_pipe[1], SESSION, errno); _exit(127); }
+        if (cwdfd >= 0 && fchdir(cwdfd) < 0) { child_report(status_pipe[1], CHDIR, errno); _exit(127); }
         if (dup2(input, STDIN_FILENO) < 0 || dup2(logfd, STDOUT_FILENO) < 0 || dup2(logfd, STDERR_FILENO) < 0) {
             child_report(status_pipe[1], REDIRECT, errno); _exit(127);
         }
@@ -291,6 +293,9 @@ LaunchResult process_start(char *const argv[], int logfd, Identity *out, Error *
     if (info.execed) { fail(err, "cannot establish pre-exec identity"); goto failed; }
     *out = (Identity){.pid = pid, .pgid = pid};
     strcpy(out->birth, info.birth); strcpy(out->boot, boot);
+    /* Evidence of the released candidate must be durable before the gate can
+       let it exec; a failed guard leaves the candidate unreleased. */
+    if (guard && guard(guard_context, out, err)) goto failed;
     bgx_test_point("before_gate");
     if (interrupted) { fail(err, "launch interrupted by signal %d", (int)interrupted); goto failed; }
     if (write_all(gate[1], "x", 1, err)) goto failed;
@@ -367,7 +372,7 @@ failed:
             outcome = LAUNCH_UNCERTAIN;
             size_t used = strlen(err->text);
             snprintf(err->text + used, sizeof(err->text) - used,
-                     "; starting record retained (child PID %ld)%s%.120s",
+                     "; uncertain launch attempt retained (child PID %ld)%s%.120s",
                      (long)pid, cleared ? "" : "; cleanup: ", cleared ? "" : cleanup.text);
         }
     }
@@ -432,6 +437,7 @@ static int wait_exit(const Identity *id, int milliseconds, Error *err) {
 }
 
 int process_stop(const Identity *id, Error *err) {
+    if (bgx_test_fault("stop_failure")) return fail(err, "injected stop failure");
     const int signals[] = {SIGTERM, SIGKILL};
     const int waits[] = {5000, 2000};
     for (int step = 0; step < 2; ++step) {

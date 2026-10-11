@@ -61,6 +61,34 @@ class BgxTest(unittest.TestCase):
     def record(self, name="web"):
         return json.loads((self.directory(name) / "meta.json").read_text())
 
+    def attempt(self, name="web"):
+        return json.loads((self.directory(name) / "attempt.json").read_text())
+
+    def write_attempt(self, value, name="web"):
+        (self.directory(name) / "attempt.json").write_text(json.dumps(value))
+
+    def attempt_value(self, name="web", argv=("/bin/sleep", "120"), cwd=None, log=None,
+                      state="uncertain", identity=None, error=None):
+        value = {
+            "schema_version": 2,
+            "name": name,
+            "state": state,
+            "argv": list(argv),
+            "cwd": str(cwd or self.cwd),
+            "started_at": "2026-01-02T03:04:05Z",
+            "log": log or "log-99",
+        }
+        if identity:
+            value["process_identity"] = identity
+        if error:
+            value["error"] = error
+        return value
+
+    def log_path(self, name="web"):
+        if (self.directory(name) / "meta.json").exists():
+            return self.directory(name) / self.record(name)["log"]
+        return self.directory(name) / self.attempt(name)["log"]
+
     def stored_record(self, name):
         for path in (self.state / "instances").iterdir():
             record = json.loads((path / "meta.json").read_text())
@@ -90,14 +118,14 @@ class BgxTest(unittest.TestCase):
     def make_log(self, contents=b""):
         self.start()
         self.cli("stop", "web")
-        path = self.directory() / "output.log"
+        path = self.log_path()
         path.write_bytes(contents)
         return path
 
     def wait_log(self, needle, name="web"):
         deadline = time.monotonic() + 5
-        path = self.directory(name) / "output.log"
         while time.monotonic() < deadline:
+            path = self.log_path(name)
             if path.exists() and needle in path.read_bytes():
                 return path.read_bytes()
             time.sleep(0.02)
@@ -192,6 +220,21 @@ class BgxTest(unittest.TestCase):
             time.sleep(0.005)
         self.fail("child did not block on its name lock")
 
+    def interrupted_first_launch(self, name="web"):
+        """Kill the launcher after durable pre-exec evidence, before release."""
+        notice = self.base / "prep-notice"
+        notice.unlink(missing_ok=True)
+        env = dict(self.env, BGX_TEST_POINT="attempt_prepared", BGX_TEST_NOTIFY=str(notice))
+        child = subprocess.Popen([os.environ["BGX_FAULT_BIN"], "start", name, "--", "/bin/sleep", "120"],
+                                 env=env, cwd=self.cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.followers.append(child)
+        self.wait_test_point(child, notice)
+        child.kill()
+        child.communicate(timeout=5)
+        self.followers.remove(child)
+        self.assertEqual(self.attempt(name)["state"], "prepared")
+        self.assertFalse((self.directory(name) / "meta.json").exists())
+
     def test_invalid_arguments(self):
         for args in [
             ("web", "--", "true"), ("run", "web", "--", "true"),
@@ -205,7 +248,10 @@ class BgxTest(unittest.TestCase):
             ("log", "web", "--follow=1"), ("log", "-f"), ("log", "--follow", "--tail", "1"),
             ("log", "web", "--tail", "1", "-f", "extra"),
             ("info",), ("info", "web", "extra"), ("info", "../escape"), ("info", "web", "--json"),
-            ("restart", "web"), ("forget", "web"),
+            ("restart",), ("restart", "web", "extra"), ("restart", "web", "--", "true"),
+            ("replace", "web"), ("replace", "web", "--"), ("replace", "web", "--", ""),
+            ("replace", "../escape", "--", "true"), ("replace", "web", "true"),
+            ("forget", "web"),
             ("prune", "web"), ("prune", "--dry-run", "web"),
             ("prune", "--dry-run", "--dry-run"), ("prune", "--force"),
             ("completion", "bash"), ("logpath", "web"),
@@ -259,7 +305,8 @@ class BgxTest(unittest.TestCase):
                 self.assertRegex(fields["Uptime"], r"^\d{2,}:\d{2}:\d{2}$")
                 self.assertEqual(fields["Directory"], json.dumps(str(self.cwd)))
                 self.assertEqual(fields["Command"], "/bin/sleep 120")
-                self.assertEqual(Path(fields["Log"]), directory / "output.log")
+                self.assertEqual(Path(fields["Log"]).parent, directory)
+                self.assertTrue(Path(fields["Log"]).name.startswith("log-"))
                 self.assertNotIn("Reason", fields)
                 self.assertEqual(meta.read_bytes(), before)
         self.cli("stop", "Web")
@@ -274,29 +321,39 @@ class BgxTest(unittest.TestCase):
         original = self.start()
         stale = deepcopy(original)
         stale["process_identity"]["start_marker"] += "-wrong"
-        pending = deepcopy(original)
-        pending.pop("process_identity")
-        pending["starting"] = True
-        for record, status, reason in [(stale, "stale", "start marker"),
-                                       (pending, "unknown", "launch")]:
-            with self.subTest(status=status):
-                self.save(record)
-                before = (self.directory() / "meta.json").read_bytes()
-                result = self.cli("info", "web")
-                fields = {key: value.strip() for key, value in
-                          (line.split(":", 1) for line in result.stdout.decode().splitlines())}
-                self.assertEqual(result.stderr, b"")
-                self.assertEqual(fields["Status"], status)
-                self.assertIn(reason, fields["Reason"])
-                self.assertEqual(fields["Uptime"], "-")
-                if status == "unknown":
-                    self.assertEqual(fields["Recorded PID"], "-")
-                    self.assertEqual(fields["Recorded PGID"], "-")
-                self.cli("stop", "web", expect=1)
-                self.assertEqual((self.directory() / "meta.json").read_bytes(), before)
-                os.kill(original["process_identity"]["pid"], 0)
+        self.save(stale)
+        before = (self.directory() / "meta.json").read_bytes()
+        result = self.cli("info", "web")
+        fields = {key: value.strip() for key, value in
+                  (line.split(":", 1) for line in result.stdout.decode().splitlines())}
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(fields["Status"], "stale")
+        self.assertIn("start marker", fields["Reason"])
+        self.assertEqual(fields["Uptime"], "-")
+        self.cli("stop", "web", expect=1)
+        self.assertEqual((self.directory() / "meta.json").read_bytes(), before)
+        os.kill(original["process_identity"]["pid"], 0)
         self.save(original)
         self.cli("stop", "web")
+        # A pending attempt dominates the confirmed, already-ended execution and
+        # is described with its own command, directory, and identity.
+        self.write_attempt(self.attempt_value(argv=("/bin/other", "x"), error="launch interrupted"))
+        before_meta = (self.directory() / "meta.json").read_bytes()
+        before_attempt = (self.directory() / "attempt.json").read_bytes()
+        result = self.cli("info", "web")
+        fields = {key: value.strip() for key, value in
+                  (line.split(":", 1) for line in result.stdout.decode().splitlines())}
+        self.assertEqual(result.stderr, b"")
+        self.assertEqual(fields["Status"], "unknown")
+        self.assertIn("launch", fields["Reason"])
+        self.assertEqual(fields["Recorded PID"], str(original["process_identity"]["pid"]))
+        self.assertEqual(fields["Pending command"], "/bin/other x")
+        self.assertEqual(fields["Pending PID"], "-")
+        self.assertEqual(fields["Attempt error"], chr(34) + "launch interrupted" + chr(34))
+        self.cli("stop", "web", expect=1)
+        self.assertEqual((self.directory() / "meta.json").read_bytes(), before_meta)
+        self.assertEqual((self.directory() / "attempt.json").read_bytes(), before_attempt)
+        (self.directory() / "attempt.json").unlink()
 
     def test_info_missing_and_invalid_records_report_named_errors(self):
         result = self.cli("info", "missing", expect=1)
@@ -326,7 +383,7 @@ class BgxTest(unittest.TestCase):
             self.assertIn(b"exited", self.cli("info", "web").stdout)
         (self.state / "locks" / "web.lock").unlink()
         (self.state / "locks").rmdir()
-        (self.directory() / "output.log").unlink()  # Info does not require a log to exist.
+        (self.log_path()).unlink()  # Info does not require a log to exist.
         directories = [self.state, self.state / "instances", self.directory()]
         try:
             for directory in directories:
@@ -345,7 +402,7 @@ class BgxTest(unittest.TestCase):
 
     def test_confirmed_completion_never_rechecks_historical_identity(self):
         unrelated = self.start("other")
-        for operation in ["stop", "rm", "reuse"]:
+        for operation in ["stop", "rm", "restart"]:
             with self.subTest(operation=operation):
                 self.start()
                 self.cli("stop", "web")
@@ -356,8 +413,9 @@ class BgxTest(unittest.TestCase):
                 before = (self.directory() / "meta.json").read_bytes()
                 self.assertIn(b"Status:        exited", self.cli("info", "web").stdout)
                 self.assertEqual((self.directory() / "meta.json").read_bytes(), before)
-                if operation == "reuse":
-                    self.start()
+                if operation == "restart":
+                    self.cli("restart", "web")
+                    self.wait_log(b"ready")
                     self.assertFalse(self.record()["exited"])
                     self.cli("stop", "web")
                 else:
@@ -365,13 +423,15 @@ class BgxTest(unittest.TestCase):
                     if operation == "stop":
                         self.assertEqual((self.directory() / "meta.json").read_bytes(), before)
                 os.kill(unrelated["process_identity"]["pid"], 0)
+                if self.directory().exists():
+                    self.cli("rm", "web", "--force")
         self.cli("stop", "other")
 
     def test_legacy_records_remain_readable(self):
         original = self.start()
         legacy = deepcopy(original)
         legacy.pop("exited")
-        legacy.pop("starting")
+        legacy.pop("starting", None)
         self.save(legacy)
         self.assertIn(b"Status:        running", self.cli("info", "web").stdout)
         self.cli("stop", "web")
@@ -407,7 +467,8 @@ class BgxTest(unittest.TestCase):
         self.assertIn(b"bgx start NAME", general)
         for args in [(), ("-h",), ("--help",)]:
             self.assertEqual(self.cli(*args).stdout, general)
-        commands = {"start": ["s"], "stop": [], "list": ["ls", "ps"], "info": [], "remove": ["rm"],
+        commands = {"start": ["s"], "restart": [], "replace": [], "stop": [],
+                    "list": ["ls", "ps"], "info": [], "remove": ["rm"],
                     "prune": [], "log": ["logs"], "help": ["-h", "--help"], "version": ["-V", "--version"]}
         for command, aliases in commands.items():
             with self.subTest(command=command):
@@ -447,7 +508,8 @@ class BgxTest(unittest.TestCase):
 
     def test_stop_preserves_launch_metadata_and_records_completion(self):
         original = self.start()
-        log = (self.directory() / "output.log").read_bytes()
+        log_path = self.log_path()
+        log = log_path.read_bytes()
         self.cli("stop", "web")
         stopped = self.record()
         self.assertEqual(stopped.get("process_identity"), original["process_identity"])
@@ -455,7 +517,7 @@ class BgxTest(unittest.TestCase):
         for key, value in original.items():
             if key != "exited":
                 self.assertEqual(stopped[key], value, key)
-        self.assertEqual((self.directory() / "output.log").read_bytes(), log)
+        self.assertEqual(log_path.read_bytes(), log)
         saved = (self.directory() / "meta.json").read_bytes()
         self.cli("stop", "web")
         self.assertEqual((self.directory() / "meta.json").read_bytes(), saved)
@@ -464,7 +526,10 @@ class BgxTest(unittest.TestCase):
     def test_stopped_name_can_be_restarted_and_removed(self):
         previous = None
         for _ in range(3):
-            self.cli("s", "web", "--", "/bin/sleep", "120")
+            if previous is None:
+                self.cli("s", "web", "--", "/bin/sleep", "120")
+            else:
+                self.cli("restart", "web")
             current = self.track()["process_identity"]["pid"]
             self.assertNotEqual(current, previous)
             row = self.cli("list").stdout.decode().splitlines()[1].split()
@@ -516,7 +581,8 @@ class BgxTest(unittest.TestCase):
         self.cli("rm", "web")
 
     def test_names_can_be_subcommands(self):
-        for name in ["start", "s", "stop", "list", "ls", "ps", "info", "remove", "rm", "prune", "log", "logs", "help", "version"]:
+        for name in ["start", "s", "restart", "replace", "stop", "list", "ls", "ps", "info",
+                     "remove", "rm", "prune", "log", "logs", "help", "version"]:
             self.start(name)
             self.cli("stop", name)
             self.cli("rm", name)
@@ -528,7 +594,7 @@ class BgxTest(unittest.TestCase):
             self.cli("s", name, "--", "/bin/sleep", "120")
             path, record = self.stored_record(name)
             stored[name] = (path, record)
-            (path / "output.log").write_bytes((name + "\n").encode())
+            (path / record["log"]).write_bytes((name + "\n").encode())
         # Storage keys must remain distinct even when the filesystem folds case.
         self.assertEqual(len({p.name.casefold() for p, _ in stored.values()}), len(names))
         locks = list((self.state / "locks").iterdir())
@@ -540,12 +606,11 @@ class BgxTest(unittest.TestCase):
             self.assertEqual(self.cli("log", name).stdout, (name + "\n").encode())
         self.cli("s", "Web", "--", "/bin/sleep", "120", expect=1)
         self.cli("stop", "Web")
-        self.cli("rm", "Web")
-        self.assertFalse(stored["Web"][0].exists())
-        self.cli("s", "Web", "--", "/bin/sleep", "120")
+        self.cli("restart", "Web")
         _, restarted = self.stored_record("Web")
         self.assertNotEqual(restarted["process_identity"]["pid"], stored["Web"][1]["process_identity"]["pid"])
         self.assertEqual(self.cli("log", "Web").stdout, b"")
+        self.assertNotEqual(restarted["log"], stored["Web"][1]["log"])
         self.cli("rm", "WEB", "--force")
         self.assertFalse(stored["WEB"][0].exists())
         os.kill(stored["WEB"][1]["process_identity"]["pid"], 0)
@@ -604,10 +669,10 @@ class BgxTest(unittest.TestCase):
     def test_active_duplicate_preserves_record_and_log(self):
         self.start()
         meta = (self.directory() / "meta.json").read_bytes()
-        output = (self.directory() / "output.log").read_bytes()
+        output = self.log_path().read_bytes()
         self.cli("start", "web", "--", "/bin/echo", "other", expect=1)
         self.assertEqual(meta, (self.directory() / "meta.json").read_bytes())
-        self.assertEqual(output, (self.directory() / "output.log").read_bytes())
+        self.assertEqual(output, self.log_path().read_bytes())
         self.cli("rm", "web", expect=1)
 
     def test_concurrent_name_claim(self):
@@ -642,22 +707,40 @@ class BgxTest(unittest.TestCase):
         self.assertEqual(self.cli("log", "web").stdout, b"path-ok\n")
         marker = self.cwd / "should-not-exist"
         script.write_text("touch should-not-exist\n")
+        self.cli("rm", "web")
         self.cli("start", "web", "--", "custom-command", env=env, expect=1)
         self.assertFalse(marker.exists())
         self.assertFalse(self.directory().exists())
 
-    def test_instant_exit_and_reuse_resets_log(self):
+    def test_restart_and_replace_get_fresh_logs(self):
         self.cli("start", "web", "--", "/bin/echo", "old")
         self.track()
         self.wait_exited()
         self.assertEqual(self.cli("log", "web").stdout, b"old\n")
-        self.cli("start", "web", "--", "/bin/echo", "new")
+        first_log = self.log_path()
+        first_inode = first_log.stat().st_ino
+        self.cli("restart", "web")
+        self.track()
+        self.wait_exited()
+        self.assertEqual(self.cli("log", "web").stdout, b"old\n")
+        second_log = self.log_path()
+        self.assertNotEqual(first_log.name, second_log.name)
+        self.assertNotEqual(first_log.stat().st_ino if first_log.exists() else first_inode,
+                            second_log.stat().st_ino)
+        self.cli("replace", "web", "--", "/bin/echo", "new")
         self.track()
         self.wait_exited()
         self.assertEqual(self.cli("log", "web").stdout, b"new\n")
-        self.assertEqual(sorted(p.name for p in self.directory().iterdir()), ["meta.json", "output.log"])
-        self.cli("start", "web", "--", str(self.base / "missing"), expect=1)
-        self.assertFalse(self.directory().exists())
+        self.assertEqual(sorted(p.name for p in self.directory().iterdir()),
+                         sorted(["meta.json", self.record()["log"]]))
+        # A failed replacement keeps the confirmed definition and its log.
+        self.cli("replace", "web", "--", str(self.base / "missing"), expect=1)
+        self.assertEqual(self.cli("log", "web").stdout, b"new\n")
+        self.cli("restart", "web")
+        self.track()
+        self.wait_exited()
+        self.assertEqual(self.cli("log", "web").stdout, b"new\n")
+        self.cli("rm", "web")
 
     def test_log_missing_instance_does_not_create_state_or_locks(self):
         result = self.cli("log", "missing", expect=1)
@@ -719,16 +802,17 @@ class BgxTest(unittest.TestCase):
                 time.sleep(0.005)
             else:
                 self.fail("log did not reach the read checkpoint")
-            self.cli("rm", "web")
-            self.make_log(b"new output\n")
+            self.cli("replace", "web", "--", "/bin/echo", "new")
             os.kill(child.pid, signal.SIGCONT)
             out, err = child.communicate(timeout=3)
             self.assertEqual(child.returncode, 1, err)
             self.assertEqual(out, b"")
-            self.assertIn(b"output.log", err)
+            # The retired log serial is gone; the reader must not print the new execution.
+            self.assertIn(b"log-", err)
             self.assertNotIn(b"AddressSanitizer", err)
             self.assertNotIn(b"runtime error:", err)
-            self.assertEqual(self.cli("log", "web").stdout, b"new output\n")
+            self.wait_log(b"new")
+            self.assertEqual(self.cli("log", "web").stdout, b"new\n")
         finally:
             if child.poll() is None:
                 child.kill()
@@ -868,14 +952,14 @@ class BgxTest(unittest.TestCase):
         self.track()
         child = self.follow()
         self.expect_output(child, b"ready\n")
-        (self.directory() / "output.log").unlink()
+        (self.log_path()).unlink()
         marker.write_text("go")
         self.expect_output(child, b"after-unlink\n")
         self.stop_follow(child)
         self.cli("stop", "web")
         self.cli("rm", "web")
 
-    def test_log_follow_keeps_original_file_when_name_is_reused(self):
+    def test_log_follow_keeps_original_file_when_task_is_replaced(self):
         marker = self.base / "exit-now"
         code = (
             "import os,sys,time\n"
@@ -890,7 +974,7 @@ class BgxTest(unittest.TestCase):
         marker.write_text("go")
         self.expect_output(child, b"alpha2\n")
         self.wait_exited()
-        self.cli("start", "web", "--", "/bin/echo", "beta")
+        self.cli("replace", "web", "--", "/bin/echo", "beta")
         self.track()
         self.wait_log(b"beta")
         self.assertIsNone(child.poll())
@@ -934,7 +1018,7 @@ class BgxTest(unittest.TestCase):
         path.unlink()
         result = self.cli("log", "-f", "web", expect=1)
         self.assertEqual(result.stdout, b"")
-        self.assertIn(b"output.log", result.stderr)
+        self.assertIn(b"log-", result.stderr)
         path.write_bytes(b"data\n")
         meta.write_text("{broken")
         result = self.cli("log", "web", "--follow", expect=1)
@@ -947,7 +1031,7 @@ class BgxTest(unittest.TestCase):
             try:
                 result = self.cli("log", "web", "-f", expect=1)
                 self.assertEqual(result.stdout, b"")
-                self.assertIn(b"output.log", result.stderr)
+                self.assertIn(b"log-", result.stderr)
             finally:
                 path.chmod(0o600)
         self.assertEqual(sorted(entry.name for entry in (self.state / "locks").iterdir()), locks)
@@ -1018,27 +1102,36 @@ class BgxTest(unittest.TestCase):
         child.stderr.close()
         self.followers.remove(child)
 
-    def test_identity_mismatch_and_starting_refuse_signals(self):
+    def test_identity_mismatch_and_pending_attempt_refuse_signals(self):
         original = self.start()
         wrong_birth = deepcopy(original)
         wrong_birth["process_identity"]["start_marker"] += "-wrong"
-        pending = deepcopy(original)
-        del pending["process_identity"]
-        pending["starting"] = True
-        for value in [wrong_birth, pending]:
-            with self.subTest(value=value):
-                self.save(value)
-                self.cli("stop", "web", expect=1)
-                self.cli("rm", "web", expect=1)
-                self.cli("start", "web", "--", "/bin/echo", "new", expect=1)
-                os.kill(original["process_identity"]["pid"], 0)
+        self.save(wrong_birth)
+        before = (self.directory() / "meta.json").read_bytes()
+        for args in [("stop", "web"), ("rm", "web"), ("start", "web", "--", "/bin/echo", "new"),
+                     ("restart", "web"), ("replace", "web", "--", "/bin/echo", "new")]:
+            self.cli(*args, expect=1)
+        self.assertEqual((self.directory() / "meta.json").read_bytes(), before)
+        os.kill(original["process_identity"]["pid"], 0)
         self.save(original)
         self.cli("stop", "web")
+        # A pending replacement attempt dominates the ended execution.
+        self.write_attempt(self.attempt_value())
+        before_meta = (self.directory() / "meta.json").read_bytes()
+        for args in [("stop", "web"), ("rm", "web"), ("start", "web", "--", "/bin/true"),
+                     ("restart", "web"), ("replace", "web", "--", "/bin/true")]:
+            with self.subTest(args=args):
+                self.cli(*args, expect=1)
+        self.assertEqual((self.directory() / "meta.json").read_bytes(), before_meta)
+        self.assertTrue((self.directory() / "attempt.json").exists())
+        self.assertIn(b"unknown", self.cli("list").stdout)
+        self.cli("rm", "web", "--force")
+        self.assertFalse(self.directory().exists())
 
     def test_previous_boot_is_exited_and_never_signals_reused_pid(self):
         # Simulate an old record whose PID/PGID now refer to a live, unrelated
         # process. The boot mismatch must bypass all signaling of that process.
-        for operation in ["stop", "rm", "reuse"]:
+        for operation in ["stop", "rm", "restart"]:
             with self.subTest(operation=operation):
                 original = self.start()
                 old = deepcopy(original)
@@ -1054,10 +1147,10 @@ class BgxTest(unittest.TestCase):
                     self.cli("rm", "web")
                     self.assertFalse(self.directory().exists())
                 else:
-                    self.cli("start", "web", "--", "/bin/echo", "reused")
+                    self.cli("restart", "web")
                     self.track()
-                    self.wait_exited()
-                    self.assertEqual(self.cli("log", "web").stdout, b"reused\n")
+                    self.wait_log(b"ready")
+                    self.assertFalse(self.record()["exited"])
                 os.kill(original["process_identity"]["pid"], 0)
                 self.cli("rm", "web", "--force")
 
@@ -1191,15 +1284,14 @@ class BgxTest(unittest.TestCase):
         wrong = deepcopy(stale)
         wrong["process_identity"]["start_marker"] += "-wrong"
         self.save(wrong, "ccc")
-        pending = self.start("ddd")
-        unknown = deepcopy(pending)
-        del unknown["process_identity"]
-        unknown["starting"] = True
-        self.save(unknown, "ddd")
+        self.start("ddd")
+        self.cli("stop", "ddd")
+        self.write_attempt(self.attempt_value(name="ddd"), "ddd")
         self.start("eee")
         self.cli("stop", "eee")
         records = {name: (self.directory(name) / "meta.json").read_bytes()
                    for name in ["bbb", "ccc", "ddd"]}
+        attempts = {name: (self.directory(name) / "attempt.json").read_bytes() for name in ["ddd"]}
         result = self.cli("prune", "--dry-run", expect=1)
         self.assertEqual(result.stdout, b"Would remove aaa\nWould remove eee\nWould remove 2 task(s).\n")
         self.assertIn(b"bgx: bbb: invalid JSON metadata", result.stderr)
@@ -1207,6 +1299,8 @@ class BgxTest(unittest.TestCase):
         self.assertIn(b"bgx: ddd: launch outcome has not been confirmed", result.stderr)
         for name, contents in records.items():
             self.assertEqual((self.directory(name) / "meta.json").read_bytes(), contents, name)
+        for name, contents in attempts.items():
+            self.assertEqual((self.directory(name) / "attempt.json").read_bytes(), contents, name)
         result = self.cli("prune", expect=1)
         self.assertEqual(result.stdout, b"Removed aaa\nRemoved eee\nRemoved 2 task(s).\n")
         self.assertIn(b"bgx: some tasks could not be pruned", result.stderr)
@@ -1215,7 +1309,15 @@ class BgxTest(unittest.TestCase):
         for name, contents in records.items():
             self.assertEqual((self.directory(name) / "meta.json").read_bytes(), contents, name)
         os.kill(stale["process_identity"]["pid"], 0)
-        os.kill(pending["process_identity"]["pid"], 0)
+
+    def test_prune_removes_failed_attempt_data_with_the_task(self):
+        self.start()
+        self.cli("stop", "web")
+        self.cli("replace", "web", "--", str(self.base / "missing"), expect=1)
+        self.assertTrue((self.directory() / "attempt.json").exists())
+        result = self.cli("prune")
+        self.assertEqual(result.stdout, b"Removed web\nRemoved 1 task(s).\n")
+        self.assertFalse(self.directory().exists())
 
     @unittest.skipIf(os.geteuid() == 0, "requires a non-root user")
     def test_prune_continues_after_deletion_failure(self):
@@ -1344,7 +1446,7 @@ class BgxTest(unittest.TestCase):
         try:
             self.wait_test_point(child, notice)
             # Reuse the name while prune waits between assessment and locking.
-            self.cli("start", "web", "--", "/bin/sleep", "120")
+            self.cli("restart", "web")
             reused = self.track()
             before = (self.directory() / "meta.json").read_bytes()
             os.kill(child.pid, signal.SIGCONT)
@@ -1368,8 +1470,8 @@ class BgxTest(unittest.TestCase):
         base = json.dumps(original)
         variants = [
             base + "{}",
-            base.replace('"schema_version": 1', '"schema_version": 2'),
-            base.replace('"schema_version": 1', '"schema_version": 1, "schema_version": 1'),
+            base.replace('"schema_version": 2', '"schema_version": 1'),
+            base.replace('"schema_version": 2', '"schema_version": 2, "schema_version": 2'),
             base.replace('"name": "web"', '"name": "other"'),
             base.replace('"name": "web"', '"name": "web\\u0000suffix"'),
             base[:-1] + ', "surprise": true}',
@@ -1379,6 +1481,7 @@ class BgxTest(unittest.TestCase):
                 path.write_text(text)
                 self.cli("stop", "web", expect=1)
                 self.cli("start", "web", "--", "/bin/echo", "new", expect=1)
+                self.cli("restart", "web", expect=1)
                 self.assertEqual(path.read_text(), text)
         self.save(original)
         self.cli("stop", "web")
@@ -1391,7 +1494,7 @@ class BgxTest(unittest.TestCase):
         self.assertEqual(before, path.read_bytes())
         for directory in [self.state, self.state / "instances", self.directory(), self.state / "locks"]:
             self.assertEqual(directory.stat().st_mode & 0o777, 0o700)
-        for file in [path, self.directory() / "output.log", self.state / "locks" / "web.lock"]:
+        for file in [path, self.log_path(), self.state / "locks" / "web.lock"]:
             self.assertEqual(file.stat().st_mode & 0o777, 0o600)
 
     def test_symlinks_are_not_followed(self):
@@ -1401,7 +1504,7 @@ class BgxTest(unittest.TestCase):
         meta = self.directory() / "meta.json"
         meta.unlink()
         meta.symlink_to(outside)
-        self.cli("start", "web", "--", "/bin/echo", "new", expect=1)
+        self.cli("replace", "web", "--", "/bin/echo", "new", expect=1)
         self.cli("rm", "web", "--force")
         self.assertEqual(outside.read_text(), "keep")
         self.directory().symlink_to(self.cwd, target_is_directory=True)
@@ -1453,6 +1556,671 @@ class BgxTest(unittest.TestCase):
                 self.assertIn(b"ready closed", self.wait_log(b"ready"))
             finally:
                 os.close(fd)
+
+    def test_start_rejects_existing_names_including_exited(self):
+        self.start()
+        for stage in ["running", "exited"]:
+            with self.subTest(stage=stage):
+                if stage == "exited":
+                    self.cli("stop", "web")
+                meta = (self.directory() / "meta.json").read_bytes()
+                log = self.log_path().read_bytes()
+                result = self.cli("start", "web", "--", "/bin/echo", "other", expect=1)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"already exists", result.stderr)
+                self.assertEqual(meta, (self.directory() / "meta.json").read_bytes())
+                self.assertEqual(log, self.log_path().read_bytes())
+                self.assertFalse((self.directory() / "attempt.json").exists())
+        self.cli("rm", "web")
+
+    def test_restart_and_replace_require_existing_names(self):
+        for args in [("restart", "missing"), ("replace", "missing", "--", "/bin/true")]:
+            with self.subTest(args=args):
+                result = self.cli(*args, expect=1)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(b"instance not found: missing", result.stderr)
+                self.assertFalse(self.directory("missing").exists())
+
+    def test_restart_uses_recorded_definition_and_current_environment(self):
+        code = (
+            "import json,os,sys,time;"
+            "print(json.dumps([sys.argv[1:],os.getcwd(),os.getenv('BGX_TEST_VALUE')]),flush=True);"
+            "time.sleep(120)"
+        )
+        self.cli("start", "web", "--", sys.executable, "-c", code, "fixed arg")
+        first = self.track()
+        self.wait_log(b"fixed arg")
+        self.cli("stop", "web")
+        env = dict(self.env, BGX_TEST_VALUE="second value")
+        result = self.cli("restart", "web", cwd=self.base, env=env)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"")
+        second = self.track()
+        output = self.wait_log(b"second value")
+        argv, cwd, value = json.loads(output.splitlines()[0])
+        self.assertEqual(argv, ["fixed arg"])
+        self.assertEqual(Path(cwd).resolve(), self.cwd.resolve())
+        self.assertEqual(value, "second value")
+        self.assertEqual(second["name"], "web")
+        self.assertEqual(second["argv"], first["argv"])
+        self.assertEqual(second["cwd"], first["cwd"])
+        self.assertNotEqual(second["process_identity"]["pid"], first["process_identity"]["pid"])
+        self.assertNotEqual(second["log"], first["log"])
+        self.assertFalse(second["exited"])
+        self.assertEqual(sorted(p.name for p in self.directory().iterdir()),
+                         sorted(["meta.json", second["log"]]))
+        self.cli("stop", "web")
+        self.cli("rm", "web")
+
+    def test_restart_stops_running_execution_before_relaunching(self):
+        self.start()
+        previous = self.track()["process_identity"]["pid"]
+        result = self.cli("restart", "web")
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"")
+        current = self.track()
+        self.assertNotEqual(current["process_identity"]["pid"], previous)
+        self.wait_log(b"ready")
+        with self.assertRaises(ProcessLookupError):
+            os.kill(previous, 0)
+        self.cli("stop", "web")
+        self.cli("rm", "web")
+
+    def test_replace_adopts_definition_only_on_success(self):
+        self.cli("start", "web", "--", "/bin/echo", "old")
+        self.track()
+        self.wait_exited()
+        confirmed = self.record()
+        missing = str(self.base / "missing")
+        result = self.cli("replace", "web", "--", missing, expect=1)
+        self.assertIn(b"missing", result.stderr)
+        self.assertEqual(self.record()["argv"], confirmed["argv"])
+        self.assertEqual(self.record()["cwd"], confirmed["cwd"])
+        self.assertEqual(self.record()["log"], confirmed["log"])
+        failed = self.attempt()
+        self.assertEqual(failed["state"], "failed")
+        self.assertEqual(failed["argv"], [missing])
+        self.assertIn("No such file", failed["error"])
+        # An acquired candidate identity is retained as historical metadata.
+        self.assertIn("process_identity", failed)
+        self.assertGreater(failed["process_identity"]["pid"], 0)
+        # The naturally exited confirmed execution is durably marked ended
+        # before the candidate may fail, with its identity preserved.
+        self.assertTrue(self.record()["exited"])
+        self.assertEqual(self.record()["process_identity"], confirmed["process_identity"])
+        self.assertEqual(sorted(p.name for p in self.directory().iterdir()),
+                         sorted(["meta.json", "attempt.json", confirmed["log"]]))
+        # A failed replacement never becomes the definition used by restart.
+        self.cli("restart", "web")
+        self.track()
+        self.wait_exited()
+        self.assertEqual(self.cli("log", "web").stdout, b"old\n")
+        self.assertEqual(self.record()["argv"], confirmed["argv"])
+        # A successful replacement adopts the supplied command and directory.
+        result = self.cli("replace", "web", "--", "/bin/echo", "new", cwd=self.base)
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"")
+        adopted = self.track()
+        self.wait_log(b"new")
+        self.assertEqual(adopted["argv"], ["/bin/echo", "new"])
+        self.assertEqual(Path(adopted["cwd"]).resolve(), self.base.resolve())
+        self.assertFalse(adopted["exited"])
+        self.assertEqual(sorted(p.name for p in self.directory().iterdir()),
+                         sorted(["meta.json", adopted["log"]]))
+        self.cli("rm", "web")
+
+    def test_retry_after_failed_replace_supersedes_the_attempt(self):
+        self.cli("start", "web", "--", "/bin/echo", "one")
+        self.track()
+        self.wait_exited()
+        self.cli("replace", "web", "--", str(self.base / "missing"), expect=1)
+        failed = self.attempt()
+        # A syntax failure before a new attempt begins keeps the diagnostics.
+        self.cli("replace", "web", "--", expect=2)
+        self.assertEqual(self.attempt(), failed)
+        self.cli("replace", "web", "--", "/bin/echo", "two")
+        self.track()
+        self.wait_log(b"two")
+        self.assertFalse((self.directory() / "attempt.json").exists())
+        self.assertEqual(self.record()["argv"], ["/bin/echo", "two"])
+        self.assertEqual(sorted(p.name for p in self.directory().iterdir()),
+                         sorted(["meta.json", self.record()["log"]]))
+        self.cli("rm", "web")
+
+    def test_preflight_failure_after_failed_replace_keeps_attempt(self):
+        directory = self.base / "recorded"
+        directory.mkdir()
+        self.cli("start", "web", "--", "/bin/echo", "old", cwd=directory)
+        self.track()
+        self.wait_exited()
+        self.cli("replace", "web", "--", str(self.base / "missing"), expect=1)
+        failed = self.attempt()
+        self.assertEqual(failed["state"], "failed")
+        # A preflight failure before a new attempt begins keeps those diagnostics.
+        directory.rmdir()
+        result = self.cli("restart", "web", expect=1)
+        self.assertIn(b"recorded directory", result.stderr)
+        self.assertEqual(self.attempt(), failed)
+        self.assertEqual(self.record()["argv"], ["/bin/echo", "old"])
+        self.cli("rm", "web", "--force")
+
+    def test_restart_checks_recorded_directory_before_stopping(self):
+        directory = self.base / "recorded"
+        directory.mkdir()
+        self.cli("start", "web", "--", "/bin/sleep", "120", cwd=directory)
+        record = self.track()
+        before = (self.directory() / "meta.json").read_bytes()
+        directory.rmdir()
+        result = self.cli("restart", "web", expect=1)
+        self.assertIn(b"recorded directory", result.stderr)
+        self.assertEqual((self.directory() / "meta.json").read_bytes(), before)
+        self.assertFalse((self.directory() / "attempt.json").exists())
+        os.kill(record["process_identity"]["pid"], 0)
+        self.assertIn(b"running", self.cli("ls").stdout)
+        self.cli("stop", "web")
+        self.cli("rm", "web")
+
+    def test_pending_attempt_dominates_and_is_never_treated_as_ended(self):
+        self.make_log(b"confirmed\n")
+        self.write_attempt(self.attempt_value(argv=("/bin/echo", "candidate"), log="log-88"))
+        (self.directory() / "log-88").write_bytes(b"candidate output\n")
+        self.assertIn(b"unknown", self.cli("list").stdout)
+        self.cli("stop", "web", expect=1)
+        self.cli("rm", "web", expect=1)
+        result = self.cli("prune", "--dry-run", expect=1)
+        self.assertEqual(result.stdout, b"Would remove 0 task(s).\n")
+        self.assertIn(b"bgx: web: launch outcome has not been confirmed", result.stderr)
+        self.cli("prune", "--dry-run", expect=1)
+        # The confirmed log stays the normal log; the attempt log is separate.
+        self.assertEqual(self.cli("log", "web").stdout, b"confirmed\n")
+        fields = {key: value.strip() for key, value in
+                  (line.split(":", 1) for line in self.cli("info", "web").stdout.decode().splitlines())}
+        self.assertEqual(fields["Log"], str(self.log_path()))
+        self.assertEqual(fields["Attempt log"], str(self.directory() / "log-88"))
+        self.assertEqual(fields["Pending command"], "/bin/echo candidate")
+        self.cli("rm", "web", "--force")
+        self.assertFalse(self.directory().exists())
+
+    def test_failed_attempt_diagnostics_are_reported_and_removed_with_task(self):
+        self.start()
+        self.cli("stop", "web")
+        self.write_attempt(self.attempt_value(argv=("/bin/bogus",), state="failed", log="log-77",
+                                              error="execute /bin/bogus: No such file or directory"))
+        (self.directory() / "log-77").write_bytes(b"partial output\n")
+        self.assertIn(b"exited", self.cli("list").stdout)
+        fields = {key: value.strip() for key, value in
+                  (line.split(":", 1) for line in self.cli("info", "web").stdout.decode().splitlines())}
+        self.assertEqual(fields["Failed command"], "/bin/bogus")
+        self.assertEqual(fields["Attempt error"], '"execute /bin/bogus: No such file or directory"')
+        self.assertEqual(fields["Attempt log"], str(self.directory() / "log-77"))
+        self.cli("stop", "web")
+        self.cli("rm", "web")
+        self.assertFalse(self.directory().exists())
+
+    def test_log_reads_attempt_log_without_confirmed_execution(self):
+        directory = self.directory()
+        directory.mkdir(parents=True)
+        self.write_attempt(self.attempt_value(argv=("/bin/echo", "only"), log="log-1"))
+        (directory / "log-1").write_bytes(b"attempt only\n")
+        self.assertEqual(self.cli("log", "web").stdout, b"attempt only\n")
+        fields = {key: value.strip() for key, value in
+                  (line.split(":", 1) for line in self.cli("info", "web").stdout.decode().splitlines())}
+        self.assertEqual(fields["Status"], "unknown")
+        self.assertEqual(fields["Log"], str(directory / "log-1"))
+        self.assertNotIn("Attempt log", fields)
+        self.cli("start", "web", "--", "/bin/true", expect=1)
+        self.cli("rm", "web", "--force")
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_interrupted_preparation_is_recovered_by_mutation(self):
+        self.interrupted_first_launch()
+        # Reads never recover; the interrupted name stays visibly unknown.
+        self.assertIn(b"unknown", self.cli("ls").stdout)
+        self.cli("stop", "web", expect=1)
+        # A mutating launch recovers the provably pre-exec attempt first.
+        self.cli("start", "web", "--", "/bin/echo", "recovered")
+        self.track()
+        self.wait_exited()
+        self.assertEqual(self.cli("log", "web").stdout, b"recovered\n")
+        self.cli("rm", "web")
+
+    def test_restart_and_replace_refuse_recovered_first_launch(self):
+        # An interrupted initial start has no confirmed definition; restart and
+        # replace must refuse by name instead of acting as an implicit start.
+        self.interrupted_first_launch()
+        result = self.cli("restart", "web", expect=1)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"no confirmed execution", result.stderr)
+        self.assertFalse(self.directory().exists())
+        self.interrupted_first_launch()
+        marker = self.base / "should-not-run"
+        result = self.cli("replace", "web", "--", "/usr/bin/touch", str(marker), expect=1)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"no confirmed execution", result.stderr)
+        self.assertFalse(marker.exists())
+        self.assertFalse(self.directory().exists())
+
+    def test_interrupted_commit_residue_reads_as_committed(self):
+        self.start()
+        confirmed = self.record()
+        # Simulate a crash between publishing meta.json and removing attempt.json.
+        residue = self.attempt_value(argv=confirmed["argv"], cwd=confirmed["cwd"], state="committing",
+                                     log=confirmed["log"], identity=confirmed["process_identity"])
+        self.write_attempt(residue)
+        self.assertIn(b"running", self.cli("list").stdout)
+        fields = {key: value.strip() for key, value in
+                  (line.split(":", 1) for line in self.cli("info", "web").stdout.decode().splitlines())}
+        self.assertEqual(fields["Status"], "running")
+        self.assertNotIn("Pending command", fields)
+        # An uncertain attempt with the same log and identity is a real
+        # candidate, not residue, and must stay visible as unknown.
+        self.write_attempt(dict(residue, state="uncertain"))
+        self.assertIn(b"unknown", self.cli("list").stdout)
+        self.cli("stop", "web", expect=1)
+        self.write_attempt(residue)
+        # A mutation discards the stale attempt record and proceeds normally.
+        self.cli("restart", "web")
+        self.track()
+        self.wait_log(b"ready")
+        self.assertFalse((self.directory() / "attempt.json").exists())
+        self.assertNotEqual(self.record()["log"], confirmed["log"])
+        self.cli("stop", "web")
+        self.cli("rm", "web")
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_interrupted_restart_preparation_preserves_confirmed_task(self):
+        self.make_log(b"ready\n")
+        confirmed = self.record()
+        notice = self.base / "prep-notice"
+        env = dict(self.env, BGX_TEST_POINT="attempt_prepared", BGX_TEST_NOTIFY=str(notice))
+        child = subprocess.Popen([os.environ["BGX_FAULT_BIN"], "restart", "web"], env=env, cwd=self.cwd,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.followers.append(child)
+        self.wait_test_point(child, notice)
+        child.kill()
+        child.communicate(timeout=5)
+        self.assertEqual(self.attempt()["state"], "prepared")
+        self.assertEqual(self.record(), confirmed)
+        self.cli("restart", "web")
+        self.track()
+        self.wait_log(b"ready")
+        self.assertFalse((self.directory() / "attempt.json").exists())
+        self.assertNotEqual(self.record()["log"], confirmed["log"])
+        self.cli("stop", "web")
+        self.cli("rm", "web")
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_prune_preserves_a_prepared_first_launch_as_unknown(self):
+        notice = self.base / "prep-notice"
+        env = dict(self.env, BGX_TEST_POINT="attempt_prepared", BGX_TEST_NOTIFY=str(notice))
+        child = subprocess.Popen([os.environ["BGX_FAULT_BIN"], "start", "web", "--", "/bin/sleep", "120"],
+                                 env=env, cwd=self.cwd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.followers.append(child)
+        self.wait_test_point(child, notice)
+        child.kill()
+        child.communicate(timeout=5)
+        self.assertEqual(self.attempt()["state"], "prepared")
+        before = {path.name: path.read_bytes() for path in self.directory().iterdir()}
+        self.assertIn(b"Status:        unknown", self.cli("info", "web").stdout)
+        for options, expected in [(["--dry-run"], b"Would remove 0 task(s).\n"),
+                                  ([], b"Removed 0 task(s).\n")]:
+            result = self.cli("prune", *options, expect=1)
+            self.assertEqual(result.stdout, expected)
+            self.assertIn(b"bgx: web:", result.stderr)
+            self.assertEqual({path.name: path.read_bytes() for path in self.directory().iterdir()}, before)
+
+    def test_prune_removes_exited_task_with_prepared_attempt(self):
+        self.make_log(b"confirmed\n")
+        self.write_attempt(self.attempt_value(state="prepared"))
+        (self.directory() / "log-99").write_bytes(b"")
+        self.assertIn(b"Status:        exited", self.cli("info", "web").stdout)
+        self.assertEqual(self.cli("prune", "--dry-run").stdout,
+                         b"Would remove web\nWould remove 1 task(s).\n")
+        self.assertEqual(self.cli("prune").stdout, b"Removed web\nRemoved 1 task(s).\n")
+        self.assertFalse(self.directory().exists())
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_prune_rechecks_unknown_without_recovering_it(self):
+        self.make_log(b"confirmed\n")
+        notice = self.base / "prune-notice"
+        env = dict(self.env, BGX_TEST_POINT="prune_candidate", BGX_TEST_NOTIFY=str(notice))
+        child = subprocess.Popen([os.environ["BGX_FAULT_BIN"], "prune"], env=env,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.followers.append(child)
+        try:
+            self.wait_test_point(child, notice)
+            # The candidate becomes an unconfirmed first launch before locking.
+            (self.directory() / "meta.json").unlink()
+            self.write_attempt(self.attempt_value(state="prepared"))
+            (self.directory() / "log-99").write_bytes(b"")
+            before = {path.name: path.read_bytes() for path in self.directory().iterdir()}
+            os.kill(child.pid, signal.SIGCONT)
+            out, err = child.communicate(timeout=5)
+            self.assertEqual(child.returncode, 1, (out, err))
+            self.assertEqual(out, b"Removed 0 task(s).\n")
+            self.assertIn(b"bgx: web:", err)
+            self.assertNotIn(b"AddressSanitizer", err)
+            self.assertNotIn(b"runtime error:", err)
+            self.assertEqual({path.name: path.read_bytes() for path in self.directory().iterdir()}, before)
+        finally:
+            if child.poll() is None:
+                child.kill()
+            child.communicate(timeout=3)
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_mutation_waits_for_name_lock_and_releases_it(self):
+        import fcntl
+        self.make_log(b"exited\n")
+        notice = self.base / "lock-notice"
+        env = dict(self.env, BGX_TEST_POINT="before_name_lock", BGX_TEST_NOTIFY=str(notice))
+        lock = (self.state / "locks" / "web.lock").open("rb")
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        child = subprocess.Popen([os.environ["BGX_FAULT_BIN"], "restart", "web"], env=env, cwd=self.cwd,
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.followers.append(child)
+        try:
+            self.wait_test_point(child, notice)
+            # The child is stopped before locking, then must block on the held lock.
+            os.kill(child.pid, signal.SIGCONT)
+            self.wait_for_name_lock(child, lock)
+            self.assertIsNone(child.poll())
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+            lock.close()
+        out, err = child.communicate(timeout=5)
+        self.assertEqual(child.returncode, 0, (out, err))
+        self.assertEqual(out, b"")
+        self.assertEqual(err, b"")
+        self.track()
+        self.wait_log(b"ready")
+        # The name lock is released for later mutations.
+        self.cli("stop", "web")
+        self.cli("rm", "web")
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_stop_failure_prevents_relaunch(self):
+        self.start()
+        record = self.track()
+        before = (self.directory() / "meta.json").read_bytes()
+        env = dict(self.env, BGX_TEST_FAULT="stop_failure")
+        result = subprocess.run([os.environ["BGX_FAULT_BIN"], "restart", "web"], env=env, cwd=self.cwd,
+                                capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 1, (result.stdout, result.stderr))
+        self.assertIn(b"injected stop failure", result.stderr)
+        self.assertEqual((self.directory() / "meta.json").read_bytes(), before)
+        self.assertFalse((self.directory() / "attempt.json").exists())
+        os.kill(record["process_identity"]["pid"], 0)
+        self.assertIn(b"running", self.cli("ls").stdout)
+        self.cli("stop", "web")
+
+    def test_replace_stops_running_execution_before_adopting(self):
+        self.start()
+        previous = self.track()["process_identity"]["pid"]
+        self.cli("replace", "web", "--", "/bin/echo", "replaced")
+        current = self.track()
+        self.assertNotEqual(current["process_identity"]["pid"], previous)
+        self.wait_log(b"replaced")
+        with self.assertRaises(ProcessLookupError):
+            os.kill(previous, 0)
+        self.cli("rm", "web")
+
+    def test_restart_uses_current_path(self):
+        first = self.base / "path-one"
+        second = self.base / "path-two"
+        first.mkdir()
+        second.mkdir()
+        (first / "chosen-command").write_text("#!/bin/sh\nprintf 'first\\n'\n")
+        (first / "chosen-command").chmod(0o700)
+        (second / "chosen-command").write_text("#!/bin/sh\nprintf 'second\\n'\n")
+        (second / "chosen-command").chmod(0o700)
+        self.cli("start", "web", "--", "chosen-command", env=dict(self.env, PATH=str(first)))
+        self.track()
+        self.wait_exited()
+        self.assertEqual(self.cli("log", "web").stdout, b"first\n")
+        self.cli("restart", "web", env=dict(self.env, PATH=str(second)))
+        self.track()
+        self.wait_exited()
+        self.assertEqual(self.cli("log", "web").stdout, b"second\n")
+        self.cli("rm", "web")
+
+    def test_recorded_env_assignment_survives_restart(self):
+        code = "import os,time; print(os.environ.get('BGX_TEST_VALUE'), flush=True); time.sleep(0.05)"
+        self.cli("start", "web", "--", "env", "BGX_TEST_VALUE=fixed", sys.executable, "-c", code)
+        self.track()
+        self.wait_exited()
+        self.assertEqual(self.cli("log", "web").stdout, b"fixed\n")
+        self.cli("restart", "web", env=dict(self.env, BGX_TEST_VALUE="changed"))
+        self.track()
+        self.wait_exited()
+        self.assertEqual(self.cli("log", "web").stdout, b"fixed\n")
+        self.cli("rm", "web")
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_read_snapshot_is_stable_across_commit(self):
+        # A failed attempt B exists; commit replaces meta A with C and removes
+        # attempt.json. A reader paused between its record samples must never
+        # combine ended A with the missing attempt.
+        self.cli("start", "web", "--", "/bin/echo", "old")
+        self.track()
+        self.wait_exited()
+        self.cli("stop", "web")
+        confirmed = self.record()
+        self.assertTrue(confirmed["exited"])
+        self.write_attempt(self.attempt_value(argv=("/bin/echo", "missing"), state="failed", log="log-98",
+                                              error="execute /bin/echo missing: No such file or directory"))
+        (self.directory() / "log-98").write_bytes(b"stale\n")
+        notice = self.base / "snapshot-notice"
+        notice.unlink(missing_ok=True)
+        reader_env = dict(self.env, BGX_TEST_POINT="task_snapshot", BGX_TEST_NOTIFY=str(notice))
+        reader = subprocess.Popen([os.environ["BGX_FAULT_BIN"], "info", "web"], env=reader_env, cwd=self.cwd,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.followers.append(reader)
+        try:
+            self.wait_test_point(reader, notice)
+            self.assertEqual(self.attempt()["state"], "failed")
+            self.cli("replace", "web", "--", "/bin/sleep", "120")
+            self.track()
+            os.kill(reader.pid, signal.SIGCONT)
+            out, err = reader.communicate(timeout=5)
+            self.assertEqual(reader.returncode, 0, (out, err))
+            self.assertEqual(err, b"")
+            self.assertNotIn(b"exited", out)
+            fields = {key: value.strip() for key, value in
+                      (line.split(":", 1) for line in out.decode().splitlines())}
+            self.assertEqual(fields["Status"], "running")
+            self.assertEqual(fields["Command"], "/bin/sleep 120")
+        finally:
+            if reader.poll() is None:
+                reader.kill()
+                reader.communicate(timeout=5)
+            self.followers.remove(reader)
+        self.cli("stop", "web")
+        self.cli("rm", "web")
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_read_snapshot_pinned_directory_removed_reports_missing(self):
+        # The reader is pinned to the prepared instance directory. Recovery for
+        # a later start unlinks that directory's contents and recreates it, so
+        # the reader must report the existing absent-task result for its
+        # coherent (emptied) snapshot, never a synthetic unnamed row.
+        self.interrupted_first_launch()
+        notice = self.base / "snapshot-notice"
+        notice.unlink(missing_ok=True)
+        reader_env = dict(self.env, BGX_TEST_POINT="task_snapshot", BGX_TEST_NOTIFY=str(notice))
+        reader = subprocess.Popen([os.environ["BGX_FAULT_BIN"], "info", "web"], env=reader_env, cwd=self.cwd,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.followers.append(reader)
+        try:
+            self.wait_test_point(reader, notice)
+            self.cli("start", "web", "--", "/bin/sleep", "120")
+            self.track()
+            os.kill(reader.pid, signal.SIGCONT)
+            out, err = reader.communicate(timeout=5)
+            self.assertEqual(reader.returncode, 1, (out, err))
+            self.assertEqual(out, b"")
+            self.assertIn(b"instance not found: web", err)
+            self.assertNotIn(b"Name:", out)
+        finally:
+            if reader.poll() is None:
+                reader.kill()
+                reader.communicate(timeout=5)
+            self.followers.remove(reader)
+        self.cli("stop", "web")
+        self.cli("rm", "web")
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_read_snapshot_first_commit_in_same_directory(self):
+        # The first commit publishes meta.json inside the pinned directory and
+        # removes the attempt record; the reader must resample and see the new
+        # confirmed record rather than not-found or a mixed snapshot.
+        self.interrupted_first_launch()
+        prepared = self.attempt()
+        notice = self.base / "snapshot-notice"
+        notice.unlink(missing_ok=True)
+        reader_env = dict(self.env, BGX_TEST_POINT="task_snapshot", BGX_TEST_NOTIFY=str(notice))
+        reader = subprocess.Popen([os.environ["BGX_FAULT_BIN"], "info", "web"], env=reader_env, cwd=self.cwd,
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.followers.append(reader)
+        try:
+            self.wait_test_point(reader, notice)
+            record = {
+                "schema_version": 2, "name": "web", "argv": ["/bin/echo", "published"],
+                "cwd": str(self.cwd), "started_at": "2026-01-02T03:04:05Z", "exited": True,
+                "log": prepared["log"],
+            }
+            (self.directory() / "meta.json").write_text(json.dumps(record))
+            (self.directory() / "attempt.json").unlink()
+            os.kill(reader.pid, signal.SIGCONT)
+            out, err = reader.communicate(timeout=5)
+            self.assertEqual(reader.returncode, 0, (out, err))
+            self.assertEqual(err, b"")
+            fields = {key: value.strip() for key, value in
+                      (line.split(":", 1) for line in out.decode().splitlines())}
+            self.assertEqual(fields["Name"], "web")
+            self.assertEqual(fields["Status"], "exited")
+            self.assertEqual(fields["Command"], "/bin/echo published")
+        finally:
+            if reader.poll() is None:
+                reader.kill()
+                reader.communicate(timeout=5)
+            self.followers.remove(reader)
+        self.cli("rm", "web")
+
+    def test_info_missing_for_empty_instance_directory(self):
+        self.directory().mkdir(parents=True)
+        result = self.cli("info", "web", expect=1)
+        self.assertEqual(result.stdout, b"")
+        self.assertIn(b"instance not found: web", result.stderr)
+        self.cli("log", "web", expect=1)
+        listed = self.cli("list").stdout.decode().splitlines()
+        self.assertEqual(len(listed), 1)
+        result = self.cli("prune")
+        self.assertEqual(result.stdout, b"Removed 0 task(s).\n")
+        self.assertEqual(result.stderr, b"")
+        self.assertTrue(self.directory().exists())
+
+    def test_unresolved_adoption_reads_use_recovery_previous(self):
+        # Hand-built unresolved adoption: meta.json names B, attempt B is
+        # committing, recovery.json holds A. Reads must use A as the confirmed
+        # execution and never treat the matching meta+attempt as adopted.
+        self.make_log(b"confirmed\n")
+        previous = self.record()
+        previous["exited"] = True
+        self.save(previous)
+        candidate = self.attempt_value(argv=("/bin/echo", "candidate"), state="committing",
+                                       log="log-88", identity={
+                                           "kind": "unix", "pid": 4242, "process_group": 4242,
+                                           "start_marker": "1", "boot_id": "boot"})
+        (self.directory() / "log-88").write_bytes(b"candidate\n")
+        self.write_attempt(candidate)
+        (self.directory() / "recovery.json").write_text(json.dumps({
+            "schema_version": 2, "name": "web", "previous": previous,
+        }))
+        fields = {key: value.strip() for key, value in
+                  (line.split(":", 1) for line in self.cli("info", "web").stdout.decode().splitlines())}
+        self.assertEqual(fields["Status"], "unknown")
+        self.assertEqual(fields["Reason"], "commit outcome has not been confirmed")
+        self.assertNotIn("candidate", fields["Command"])
+        self.assertEqual(fields["Recorded PID"], str(previous["process_identity"]["pid"]))
+        self.assertEqual(fields["Log"], str(self.directory() / previous["log"]))
+        self.assertEqual(fields["Pending command"], "/bin/echo candidate")
+        self.assertEqual(self.cli("log", "web").stdout, b"confirmed\n")
+        self.assertIn(b"unknown", self.cli("list").stdout)
+        for args in [("stop", "web"), ("rm", "web"), ("restart", "web"),
+                     ("replace", "web", "--", "/bin/true")]:
+            with self.subTest(args=args):
+                self.cli(*args, expect=1)
+        result = self.cli("prune", "--dry-run", expect=1)
+        self.assertIn(b"commit outcome has not been confirmed", result.stderr)
+        self.cli("rm", "web", "--force")
+        self.assertFalse(self.directory().exists())
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_failed_b_then_failed_c_retains_a_and_c_only(self):
+        self.cli("start", "web", "--", "/bin/echo", "one")
+        self.track()
+        self.wait_exited()
+        confirmed = self.record()
+        fault_bin = os.environ["BGX_FAULT_BIN"]
+
+        def failed_replace(program):
+            # Wait for real candidate output at the pre-publication checkpoint,
+            # then resume into the injected commit failure; the launcher is
+            # stopped while the output is written, so nothing races the abort.
+            notice = self.base / ("fail-" + program[-1])
+            notice.unlink(missing_ok=True)
+            env = dict(self.env, BGX_TEST_FAULT="save_identity", BGX_TEST_POINT="before_publication",
+                       BGX_TEST_NOTIFY=str(notice))
+            child = subprocess.Popen([fault_bin, "replace", "web", "--", *program], env=env, cwd=self.cwd,
+                                     stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.followers.append(child)
+            try:
+                self.wait_test_point(child, notice)
+                attempted = self.attempt()
+                self.assertEqual(attempted["state"], "committing")
+                log = self.directory() / attempted["log"]
+                deadline = time.monotonic() + 3
+                while time.monotonic() < deadline and program[-1].encode() not in log.read_bytes():
+                    time.sleep(0.005)
+                self.assertIn(program[-1].encode(), log.read_bytes())
+                os.kill(child.pid, signal.SIGCONT)
+                out, err = child.communicate(timeout=5)
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.communicate(timeout=5)
+                self.followers.remove(child)
+            self.assertNotIn(b"AddressSanitizer", err)
+            self.assertEqual(child.returncode, 1, (out, err))
+            self.assertIn(b"metadata write failure", err)
+            self.assertIn(b"attempt log:", err)
+
+        failed_replace(["/bin/echo", "two"])
+        second = self.attempt()
+        self.assertEqual(second["argv"], ["/bin/echo", "two"])
+        second_log = self.directory() / second["log"]
+        self.assertIn(b"two", second_log.read_bytes())
+        failed_replace(["/bin/echo", "three"])
+        third = self.attempt()
+        self.assertEqual(third["argv"], ["/bin/echo", "three"])
+        third_log = self.directory() / third["log"]
+        self.assertIn(b"three", third_log.read_bytes())
+        self.assertNotEqual(second["log"], third["log"])
+        self.assertFalse(second_log.exists())
+        current = self.record()
+        self.assertEqual(current["argv"], confirmed["argv"])
+        self.assertEqual(current["cwd"], confirmed["cwd"])
+        self.assertEqual(current["log"], confirmed["log"])
+        self.assertEqual(current["process_identity"], confirmed["process_identity"])
+        self.assertTrue(current["exited"])
+        self.assertEqual(sorted(p.name for p in self.directory().iterdir()),
+                         sorted(["meta.json", "attempt.json", confirmed["log"], third["log"]]))
+        fields = {key: value.strip() for key, value in
+                  (line.split(":", 1) for line in self.cli("info", "web").stdout.decode().splitlines())}
+        self.assertEqual(fields["Command"], "/bin/echo one")
+        self.assertEqual(fields["Failed command"], "/bin/echo three")
+        self.assertEqual(fields["Attempt log"], str(third_log))
+        self.cli("rm", "web")
 
 
 if __name__ == "__main__":
