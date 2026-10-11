@@ -8,9 +8,20 @@
 #include <string.h>
 #include <unistd.h>
 
+/* Fault names may be comma-separated so one invocation can combine injections
+   that occur at different points (for example a post-rename sync failure and an
+   abort that cannot confirm cleanup). */
 int bgx_test_fault(const char *point) {
     const char *fault = getenv("BGX_TEST_FAULT");
-    return fault && !strcmp(fault, point);
+    if (!fault) return 0;
+    size_t length = strlen(point);
+    for (const char *item = fault; *item; ) {
+        size_t item_length = strcspn(item, ",");
+        if (item_length == length && !strncmp(item, point, item_length)) return 1;
+        item += item_length;
+        if (*item) item++;
+    }
+    return 0;
 }
 
 static void notify_pid(const char *file, pid_t pid) {
