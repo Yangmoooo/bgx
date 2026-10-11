@@ -1,38 +1,36 @@
 # Changelog
 
-All notable changes to this project will be documented in this file.
-
-The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
-and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+Notable changes, following [Keep a Changelog](https://keepachangelog.com/en/1.1.0/)
+and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
 ### Added
 
-- `prune [--dry-run]` removes records and logs only for tasks assessed as exited,
-  never signals processes, and leaves running tasks unchanged. Each name is locked
-  and rechecked before deletion; stale or unknown records, unreadable records, and
-  failed deletions are reported by name while other eligible tasks are cleaned.
-  `--dry-run` previews candidates without changing state or waiting on locks.
-- `info NAME` shows task metadata, current status and available diagnostic reasons,
-  recorded process IDs, local start time, uptime, and log path without changing state.
-- `log NAME -f`/`--follow` prints existing log output and then streams appended bytes
-  from the same opened log, staying through task exit and name reuse until interrupted
-  or the output closes. `--tail N` still selects the initial lines; observed truncation
-  restarts the view from that file's beginning, and a closed output pipe exits 0.
+- `restart NAME` reruns the recorded command in its recorded directory.
+- `replace NAME -- PROGRAM [ARGS...]` adopts a new command and directory on
+  successful launch. Both commands stop any running execution first.
+- `prune [--dry-run]` removes exited tasks or previews the selection.
+- `info NAME` shows task details, status diagnostics, and log paths.
+- `log -f`/`--follow` streams the opened log across task exit and name replacement;
+  `--tail N` selects initial output.
 
 ### Changed
 
-- `stop` retains recorded process identity and marks confirmed completion separately;
-  completed tasks no longer depend on their historical process numbers for status.
+- `start` rejects all existing names; use `restart` or `replace` instead.
+- Tasks retain their last confirmed execution and at most one latest launch
+  attempt. Failed restart/replace preserves the old definition and log; uncertain
+  outcomes block further launches and ordinary removal. `info` shows attempt details.
+- **Storage schema 2 is incompatible with earlier formats.** Stop tasks with the
+  old version, verify exit, delete the selected state directory, and recreate them.
+  No automatic migration is provided.
+- `stop` preserves process identity and records confirmed completion separately.
 
 ### Fixed
 
-- `list` now shows invalid or unreadable records as `unknown`, reports errors by
-  name, and continues listing other tasks before exiting nonzero.
-- `log` no longer creates state directories or lock files, changes their
-  permissions, or waits for a name lock; concurrent name reuse cannot redirect
-  the read to another task's log.
+- `list` reports invalid records by name and continues listing, returning nonzero.
+- `log` reads without creating state, changing permissions, or acquiring name locks;
+  concurrent name reuse cannot redirect a read to another execution's log.
 
 ## [0.1.0] - 2026-10-10
 
