@@ -750,16 +750,31 @@ static int next_log_serial(Store *s, const char *name, char log[BGX_LOG_NAME], E
     int dir = open_instance(s, name, true, err);
     if (dir < 0) return -1;
     unsigned long long highest = 0;
-    DIR *entries = fdopendir(dup(dir));
-    if (entries) {
-        struct dirent *ent;
-        while ((ent = readdir(entries))) {
-            unsigned long long value;
-            if (!valid_log_name(ent->d_name)) continue;
-            if (sscanf(ent->d_name + 4, "%llu", &value) == 1 && value > highest) highest = value;
-        }
-        closedir(entries);
+    int duplicate = dup(dir);
+    if (duplicate < 0) { close(dir); return syserr(err, "duplicate instance directory"); }
+    DIR *entries = fdopendir(duplicate);
+    if (!entries) {
+        int saved_errno = errno;
+        close(duplicate);
+        close(dir);
+        errno = saved_errno;
+        return syserr(err, "read instance directory");
     }
+    struct dirent *ent;
+    errno = 0;
+    while ((ent = readdir(entries))) {
+        unsigned long long value;
+        if (!valid_log_name(ent->d_name)) continue;
+        if (sscanf(ent->d_name + 4, "%llu", &value) == 1 && value > highest) highest = value;
+    }
+    if (errno) {
+        int saved_errno = errno;
+        closedir(entries);
+        close(dir);
+        errno = saved_errno;
+        return syserr(err, "read instance directory");
+    }
+    closedir(entries);
     if (highest >= 999999999999999999ULL) { close(dir); return fail(err, "log serials exhausted"); }
     for (unsigned long long value = highest + 1, tries = 0; tries < 1000; ++value, ++tries) {
         snprintf(log, BGX_LOG_NAME, "log-%llu", value);
@@ -923,18 +938,30 @@ int store_cleanup(Store *s, const char *name, Error *err) {
         close(dir);
         return 0;
     }
-    DIR *entries = fdopendir(dup(dir));
-    if (!entries) {
+    int duplicate = dup(dir);
+    if (duplicate < 0) {
         record_free(&record);
         attempt_free(&attempt);
         recovery_free(&recovery);
         close(dir);
+        return syserr(err, "duplicate instance directory");
+    }
+    DIR *entries = fdopendir(duplicate);
+    if (!entries) {
+        int saved_errno = errno;
+        close(duplicate);
+        record_free(&record);
+        attempt_free(&attempt);
+        recovery_free(&recovery);
+        close(dir);
+        errno = saved_errno;
         return syserr(err, "read instance directory");
     }
+    int read_error = 0;
     for (;;) {
         errno = 0;
         struct dirent *ent = readdir(entries);
-        if (!ent) break;
+        if (!ent) { read_error = errno; break; }
         if (!strcmp(ent->d_name, ".") || !strcmp(ent->d_name, "..")) continue;
         if (!strcmp(ent->d_name, "meta.json") || !strcmp(ent->d_name, "attempt.json") ||
             !strcmp(ent->d_name, "recovery.json")) continue;
@@ -954,6 +981,7 @@ int store_cleanup(Store *s, const char *name, Error *err) {
     attempt_free(&attempt);
     recovery_free(&recovery);
     close(dir);
+    if (read_error) { errno = read_error; return syserr(err, "read instance directory"); }
     return 0;
 }
 
