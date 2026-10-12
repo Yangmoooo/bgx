@@ -101,10 +101,16 @@ make            # Release binary: build/bgx
 make debug      # Debug binary: build/debug/bgx
 make test       # Integration tests
 make sanitize   # ASan/UBSan checks
-make check      # Both test suites
+make check      # Full production and fault-injection test suites
 make clean      # Remove build/ and dist/, not task data
 make TARGET_OS=linux TARGET_ARCH=arm64 BUILD=build/linux-arm64
 make release TAG=vX.Y.Z
 ```
 
 Use `make MODE=debug test` to test a debug build.
+CI runs `make check`, builds both architectures, and verifies the packages on every
+push and pull request. It checks that the native packaged binary matches the one
+tested. Tag builds inject the release version; other builds use `dev`.
+After a successful tag build, CI calls the Release workflow to publish those exact
+packages. Release does not rebuild or run tests. `make release TAG=dev` can be used
+to check packaging locally without preparing release notes.

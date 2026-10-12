@@ -10,7 +10,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
   check:
@@ -19,12 +19,18 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest]
+        include:
+          - os: ubuntu-latest
+            platform: linux
+          - os: macos-latest
+            platform: darwin
     defaults:
       run:
         shell: bash
     env:
       UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+      PLATFORM: ${{ matrix.platform }}
+      RELEASE_TAG: ${{ startsWith(github.ref, 'refs/tags/v') && github.ref_name || 'dev' }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -35,9 +41,53 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ steps.zig.outputs.version }}
-      - name: Zig target tests and native sanitizers
-        run: make check
-      - name: Production-only suite
-        run: make test-production
-      - name: Validate release scripts
-        run: bash -n scripts/zig-cc.sh scripts/release-notes.sh scripts/package.sh
+      - name: Validate scripts and release notes
+        run: |
+          bash -n scripts/zig-cc.sh scripts/release-notes.sh scripts/package.sh
+          if [[ $RELEASE_TAG != dev ]]; then
+            bash scripts/release-notes.sh "$RELEASE_TAG" > /dev/null
+          fi
+      - name: Production, fault-injection, and sanitizer tests
+        run: make check VERSION="${RELEASE_TAG#v}"
+      - name: Build packages
+        run: bash scripts/package.sh "$RELEASE_TAG" "$PLATFORM"
+      - name: Verify packages and prepare publication files
+        run: |
+          verify_dir=$(mktemp -d)
+          trap 'rm -rf "$verify_dir"' EXIT
+          for arch in amd64 arm64; do
+            mkdir "$verify_dir/$arch"
+            tar -xzf "dist/bgx-$PLATFORM-$arch.tar.gz" -C "$verify_dir/$arch"
+            for file in bgx README.md CHANGELOG.md cJSON-LICENSE; do
+              test -s "$verify_dir/$arch/$file"
+            done
+            test -x "$verify_dir/$arch/bgx"
+          done
+          case "$(uname -m)" in
+            x86_64) native_arch=amd64 ;;
+            arm64|aarch64) native_arch=arm64 ;;
+            *) exit 1 ;;
+          esac
+          # Publish the same native binary that passed the full test suite.
+          cmp build/bgx "$verify_dir/$native_arch/bgx"
+          [[ $("$verify_dir/$native_arch/bgx" version) == "bgx ${RELEASE_TAG#v}" ]]
+          if [[ $RELEASE_TAG != dev && $PLATFORM == linux ]]; then
+            bash scripts/release-notes.sh "$RELEASE_TAG" > dist/RELEASE_NOTES.md
+          fi
+          cd dist
+          shasum -a 256 "bgx-$PLATFORM-amd64.tar.gz" "bgx-$PLATFORM-arm64.tar.gz" > "SHA256SUMS-$PLATFORM"
+      - uses: actions/upload-artifact@v7
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+        with:
+          name: bgx-${{ matrix.platform }}
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: check
+    permissions:
+      contents: write
+    uses: ./.github/workflows/release.yml
+    with:
+      tag: ${{ github.ref_name }}

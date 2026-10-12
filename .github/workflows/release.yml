@@ -1,88 +1,34 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
+  workflow_call:
+    inputs:
+      tag:
+        required: true
+        type: string
 
 permissions:
-  contents: read
-
-concurrency:
-  group: release-${{ github.ref }}
-  cancel-in-progress: false
+  contents: write
 
 jobs:
-  build:
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 20
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            platform: linux
-          - os: macos-latest
-            platform: darwin
-    defaults:
-      run:
-        shell: bash
-    env:
-      RELEASE_TAG: ${{ github.ref_name }}
-      UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
-    steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
-      - name: Validate version and notes
-        run: bash scripts/release-notes.sh "$RELEASE_TAG"
-      - name: Read Zig version
-        id: zig
-        run: echo "version=$(cat .zig-version)" >> "$GITHUB_OUTPUT"
-      - uses: mlugg/setup-zig@v2
-        with:
-          version: ${{ steps.zig.outputs.version }}
-      - name: Zig target tests and native sanitizers
-        run: make check
-      - name: Build amd64 and arm64 packages
-        run: bash scripts/package.sh "$RELEASE_TAG"
-      - uses: actions/upload-artifact@v7
-        with:
-          name: bgx-${{ matrix.platform }}
-          path: dist/bgx-${{ matrix.platform }}-*.tar.gz
-          if-no-files-found: error
-
   publish:
-    needs: build
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    permissions:
-      contents: write
     env:
-      RELEASE_TAG: ${{ github.ref_name }}
+      RELEASE_TAG: ${{ inputs.tag }}
     steps:
-      - uses: actions/checkout@v7
-        with:
-          persist-credentials: false
       - uses: actions/download-artifact@v8
         with:
           pattern: bgx-*
           path: dist
           merge-multiple: true
-      - name: Prepare notes and checksums
-        shell: bash
-        run: |
-          bash scripts/release-notes.sh "$RELEASE_TAG" > "$RUNNER_TEMP/release-notes.md"
-          cd dist
-          for target in linux-amd64 linux-arm64 darwin-amd64 darwin-arm64; do
-            test -s "bgx-${target}.tar.gz"
-          done
-          sha256sum bgx-*.tar.gz > SHA256SUMS
-      - name: Publish
+      - name: Publish verified packages
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         shell: bash
         run: |
+          cat dist/SHA256SUMS-linux dist/SHA256SUMS-darwin > dist/SHA256SUMS
           gh release create "$RELEASE_TAG" dist/bgx-*.tar.gz dist/SHA256SUMS \
             --verify-tag --title "bgx ${RELEASE_TAG#v}" \
-            --notes-file "$RUNNER_TEMP/release-notes.md"
+            --notes-file dist/RELEASE_NOTES.md
