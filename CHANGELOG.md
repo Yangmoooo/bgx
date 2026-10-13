@@ -5,6 +5,11 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Argument errors explain the problem and show the relevant command's usage.
+- Command help accepts `-h`/`--help` anywhere before `--`; program arguments after it remain unchanged.
+
 ## [0.2.0] - 2026-10-11
 
 ### Added

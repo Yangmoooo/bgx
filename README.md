@@ -41,6 +41,9 @@ Uninstall with `make uninstall PREFIX="$HOME/.local"` (use your installation pre
 | `bgx prune [--dry-run]` | Delete all exited tasks, or preview the selection |
 | `bgx help [COMMAND]` / `bgx version` | Show help or version |
 
+Use `bgx help COMMAND` or add `-h`/`--help` anywhere in a command's arguments
+before `--`. Everything after `--` in `start` and `replace` belongs to the launched program.
+
 Names are case-sensitive, unique within a state directory, and contain 1–128 ASCII
 letters, digits, `_`, or `-`, beginning with a letter or digit. `start` rejects
 existing names, including exited tasks; use `restart` or `replace` instead.

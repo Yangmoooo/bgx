@@ -264,6 +264,67 @@ class BgxTest(unittest.TestCase):
         self.assertIn(b"NAME", self.cli("ls").stdout)
         self.assertFalse(self.state.exists())
 
+    def test_argument_errors_explain_cause_and_show_local_usage(self):
+        cases = [
+            (("log", "web", "--tail"), "--tail requires a value", "log"),
+            (("logs", "web", "--tail", "-1"), "--tail requires a nonnegative integer", "log"),
+            (("log", "web", "--foo"), "unknown option: --foo", "log"),
+            (("log", "web", "-f", "--follow"), "duplicate option: --follow", "log"),
+            (("log", "web", "--tail", "1", "--tail", "2"), "duplicate option: --tail", "log"),
+            (("rm", "web", "--force", "--force"), "duplicate option: --force", "remove"),
+            (("prune", "--dry-run", "--dry-run"), "duplicate option: --dry-run", "prune"),
+            (("restart",), "missing task name", "restart"),
+            (("stop", "web", "extra"), "unexpected argument: extra", "stop"),
+            (("ls", "extra"), "unexpected argument: extra", "list"),
+            (("version", "extra"), "unexpected argument: extra", "version"),
+            (("start", "--", "true"), "missing task name", "start"),
+            (("start", "web", "true"), "expected '--' after task name", "start"),
+            (("replace", "web", "--"), "missing program after '--'", "replace"),
+            (("help", "missing"), "unknown command: missing", "help"),
+        ]
+        for args, message, command in cases:
+            with self.subTest(args=args):
+                result = self.cli(*args, expect=2)
+                self.assertEqual(result.stdout, b"")
+                self.assertIn(f"bgx: {message}\n".encode(), result.stderr)
+                usages = [line.strip() for line in result.stderr.splitlines() if line.startswith(b"  bgx ")]
+                self.assertEqual(len(usages), 1)
+                self.assertEqual(usages[0].split()[1], command.encode())
+        self.assertIn(b"unknown command: missing", self.cli("missing", expect=2).stderr)
+        self.assertFalse(self.state.exists())
+
+    def test_help_anywhere_before_separator_has_no_task_side_effects(self):
+        cases = [("log", ["web", "--tail", "10", "-f"]), ("logs", ["web", "--tail"]),
+                 ("start", ["web"]), ("s", ["web"]), ("replace", ["web"]),
+                 ("restart", ["web"]), ("stop", ["web"]), ("info", ["web"]),
+                 ("remove", ["web", "--force"]), ("prune", ["--dry-run"]),
+                 ("list", []), ("version", [])]
+        for command, arguments in cases:
+            expected = self.cli("help", command).stdout
+            for option in ["-h", "--help"]:
+                for position in range(len(arguments) + 1):
+                    args = [command, *arguments[:position], option, *arguments[position:]]
+                    with self.subTest(args=args):
+                        self.assertEqual(self.cli(*args).stdout, expected)
+        self.assertFalse(self.state.exists())
+        self.start()
+        before = (self.directory() / "meta.json").read_bytes()
+        for command in ["stop", "remove", "restart", "replace"]:
+            self.cli(command, "web", "--help")
+        self.cli("prune", "--help")
+        self.assertEqual((self.directory() / "meta.json").read_bytes(), before)
+        self.assertIn(b"running", self.cli("list").stdout)
+
+    def test_program_help_flags_after_separator_are_forwarded(self):
+        forwarded = ["--help", "-h", "--tail", "--force", "", "--"]
+        code = "import json,sys; print(json.dumps(sys.argv[1:]),flush=True)"
+        for command in ["start", "replace"]:
+            self.cli(command, "web", "--", sys.executable, "-c", code, *forwarded)
+            self.track()
+            self.wait_exited()
+            self.assertEqual(json.loads(self.cli("log", "web").stdout), forwarded)
+            self.assertEqual(self.record()["argv"][-len(forwarded):], forwarded)
+
     def test_list_continues_after_invalid_records(self):
         self.start("aaa")
         self.start("bbb")

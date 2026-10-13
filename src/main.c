@@ -13,6 +13,11 @@
 #define BGX_VERSION "dev"
 #endif
 
+typedef enum {
+    CMD_START, CMD_RESTART, CMD_REPLACE, CMD_STOP, CMD_LIST, CMD_INFO,
+    CMD_REMOVE, CMD_PRUNE, CMD_LOG, CMD_HELP, CMD_VERSION, CMD_COUNT
+} Command;
+
 static const struct {
     const char *name;
     const char *syntax;
@@ -20,41 +25,41 @@ static const struct {
     const char *details;
     const char *aliases[3];
 } commands[] = {
-    {"start", "start NAME -- PROGRAM [ARGS...]", "Start a new named background command.",
+    [CMD_START] = {"start", "start NAME -- PROGRAM [ARGS...]", "Start a new named background command.",
      "Rejects names that already exist, even exited ones; use restart or replace for those.\n"
      "The command inherits the current directory and environment.\n"
      "Output is logged; terminal input is disabled.\n", {"s"}},
-    {"restart", "restart NAME", "Launch another execution of an existing task.",
+    [CMD_RESTART] = {"restart", "restart NAME", "Launch another execution of an existing task.",
      "Uses the task's recorded command and directory with the current invocation's environment.\n"
      "A running execution is stopped and confirmed ended first. The task's recorded definition\n"
      "is unchanged; exit 0 means the new execution started.\n", {NULL}},
-    {"replace", "replace NAME -- PROGRAM [ARGS...]", "Adopt a new command for an existing task and launch it.",
+    [CMD_REPLACE] = {"replace", "replace NAME -- PROGRAM [ARGS...]", "Adopt a new command for an existing task and launch it.",
      "Uses the supplied command and the current directory and environment.\n"
      "A running execution is stopped and confirmed ended first. The new definition is adopted\n"
      "only when the launch succeeds.\n", {NULL}},
-    {"stop", "stop NAME", "Stop a background command and its process group.",
+    [CMD_STOP] = {"stop", "stop NAME", "Stop a background command and its process group.",
      "Send TERM, wait up to 5 seconds, then KILL if needed. Keep the record and log.\n", {NULL}},
-    {"list", "list", "List background commands and their status.",
+    [CMD_LIST] = {"list", "list", "List background commands and their status.",
      "Show name, status, PID, uptime, and command.\n", {"ls", "ps"}},
-    {"info", "info NAME", "Show a task's record and current status.",
+    [CMD_INFO] = {"info", "info NAME", "Show a task's record and current status.",
      "Show recorded process IDs, local start time, uptime, directory, command, and log path.\n"
      "Recorded IDs are historical metadata, not proof that a process is still running.\n"
      "A pending or failed launch attempt is shown separately from the confirmed execution.\n", {NULL}},
-    {"remove", "remove NAME [--force]", "Remove a command's record and log.",
+    [CMD_REMOVE] = {"remove", "remove NAME [--force]", "Remove a command's record and log.",
      "The command must have exited. --force deletes data without stopping any processes.\n", {"rm"}},
-    {"prune", "prune [--dry-run]", "Remove records and logs for tasks that have exited.",
+    [CMD_PRUNE] = {"prune", "prune [--dry-run]", "Remove records and logs for tasks that have exited.",
      "Only tasks assessed as exited qualify; running tasks are skipped silently and no\n"
      "processes are signalled. Stale or unknown identity, unreadable records, and failed\n"
      "deletions are reported by name and make the command exit nonzero after other\n"
      "eligible tasks are removed.\n"
      "--dry-run lists what would be removed without changing files or waiting on locks.\n", {NULL}},
-    {"log", "log NAME [--tail N] [-f|--follow]", "Print a command's log, optionally following new output.",
+    [CMD_LOG] = {"log", "log NAME [--tail N] [-f|--follow]", "Print a command's log, optionally following new output.",
      "Print the full log by default, or the last N lines with --tail N.\n"
      "N must be a nonnegative integer; 0 prints nothing.\n"
      "-f/--follow keeps printing appended output until interrupted or the output closes.\n"
      "A follow session stays with the log opened for this execution, even after the name is reused.\n", {"logs"}},
-    {"help", "help [COMMAND]", "Show general or command-specific help.", "", {"-h", "--help"}},
-    {"version", "version", "Show the bgx version.", "", {"-V", "--version"}},
+    [CMD_HELP] = {"help", "help [COMMAND]", "Show general or command-specific help.", "", {"-h", "--help"}},
+    [CMD_VERSION] = {"version", "version", "Show the bgx version.", "", {"-V", "--version"}},
 };
 
 static void print_aliases(FILE *out, size_t index) {
@@ -75,13 +80,13 @@ static void usage(FILE *out) {
     }
 }
 
-static const char *resolve_command(const char *cmd) {
+static Command resolve_command(const char *cmd) {
     for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); ++i) {
-        if (!strcmp(cmd, commands[i].name)) return commands[i].name;
+        if (!strcmp(cmd, commands[i].name)) return (Command)i;
         for (size_t j = 0; commands[i].aliases[j]; ++j)
-            if (!strcmp(cmd, commands[i].aliases[j])) return commands[i].name;
+            if (!strcmp(cmd, commands[i].aliases[j])) return (Command)i;
     }
-    return NULL;
+    return CMD_COUNT;
 }
 
 static void command_help(FILE *out, const char *cmd) {
@@ -96,6 +101,83 @@ static void command_help(FILE *out, const char *cmd) {
 }
 
 static bool is_help(const char *arg) { return !strcmp(arg, "--help") || !strcmp(arg, "-h"); }
+
+typedef struct {
+    Command command;
+    bool help, force, follow, dry_run, has_tail;
+    Command help_command;
+    const char *name;
+    uintmax_t tail_lines;
+    int program_argc;
+    char **program_argv;
+} Arguments;
+
+/* Parse only: borrow argv strings and never open state or execute a command.
+   CMD_COUNT denotes general help (or an unrecognized command on error). */
+static int parse_arguments(int argc, char **argv, Arguments *out, Error *err) {
+    *out = (Arguments){.command = CMD_HELP, .help_command = CMD_COUNT};
+    if (argc == 1) { out->help = true; return 0; }
+    Command command = out->command = resolve_command(argv[1]);
+    if (command == CMD_COUNT) return fail(err, "unknown command: %s", argv[1]);
+    if (command == CMD_HELP) {
+        if (argc > 3) return fail(err, "unexpected argument: %s", argv[3]);
+        if (argc == 3) {
+            out->help_command = resolve_command(argv[2]);
+            if (out->help_command == CMD_COUNT) return fail(err, "unknown command: %s", argv[2]);
+        }
+        out->help = true;
+        return 0;
+    }
+    /* Help takes precedence over other bgx arguments, but never crosses --. */
+    for (int i = 2; i < argc && strcmp(argv[i], "--"); ++i) {
+        if (is_help(argv[i])) {
+            out->help = true;
+            out->help_command = command;
+            return 0;
+        }
+    }
+    if (command == CMD_START || command == CMD_REPLACE) {
+        if (argc < 3 || !strcmp(argv[2], "--")) return fail(err, "missing task name");
+        if (argv[2][0] == '-') return fail(err, "unknown option: %s", argv[2]);
+        out->name = argv[2];
+        if (valid_name(out->name, err)) return -1;
+        if (argc < 4 || strcmp(argv[3], "--")) return fail(err, "expected '--' after task name");
+        if (argc < 5 || !*argv[4]) return fail(err, "missing program after '--'");
+        out->program_argc = argc - 4;
+        out->program_argv = argv + 4;
+        return 0;
+    }
+    bool needs_name = command == CMD_RESTART || command == CMD_STOP || command == CMD_INFO ||
+                      command == CMD_REMOVE || command == CMD_LOG;
+    for (int i = 2; i < argc; ++i) {
+        const char *arg = argv[i];
+        bool *flag = NULL;
+        if (command == CMD_REMOVE && !strcmp(arg, "--force")) flag = &out->force;
+        else if (command == CMD_PRUNE && !strcmp(arg, "--dry-run")) flag = &out->dry_run;
+        else if (command == CMD_LOG && (!strcmp(arg, "-f") || !strcmp(arg, "--follow"))) flag = &out->follow;
+        if (flag) {
+            if (*flag) return fail(err, "duplicate option: %s", arg);
+            *flag = true;
+        } else if (command == CMD_LOG && !strcmp(arg, "--tail")) {
+            if (out->has_tail) return fail(err, "duplicate option: --tail");
+            if (++i == argc) return fail(err, "--tail requires a value");
+            const char *number = argv[i];
+            if (!*number || strspn(number, "0123456789") != strlen(number))
+                return fail(err, "--tail requires a nonnegative integer");
+            errno = 0;
+            out->tail_lines = strtoumax(number, NULL, 10);
+            if (errno == ERANGE) return fail(err, "--tail count is too large");
+            out->has_tail = true;
+        } else if (arg[0] == '-') return fail(err, "unknown option: %s", arg);
+        else if (!needs_name || out->name) return fail(err, "unexpected argument: %s", arg);
+        else out->name = arg;
+    }
+    if (needs_name) {
+        if (!out->name) return fail(err, "missing task name");
+        return valid_name(out->name, err);
+    }
+    return 0;
+}
 
 /* A task's durable state: the confirmed execution (meta.json), at most one
    latest launch attempt (attempt.json), and an optional recovery artifact
@@ -963,79 +1045,34 @@ int main(int argc, char **argv) {
     }
     signal(SIGPIPE, SIG_IGN);
     signal(SIGCHLD, SIG_DFL);
-    if (argc == 1) { usage(stdout); return 0; }
     Error err = {0};
-    const char *command = resolve_command(argv[1]);
-    if (!command) goto syntax;
-    if (argc == 2 && !strcmp(command, "version")) {
-        printf("bgx %s\n", BGX_VERSION); return 0;
+    Arguments args;
+    if (parse_arguments(argc, argv, &args, &err)) {
+        fprintf(stderr, "bgx: %s\n\n", err.text);
+        if (args.command == CMD_COUNT) usage(stderr);
+        else fprintf(stderr, "Usage:\n  bgx %s\n", commands[args.command].syntax);
+        return 2;
     }
-    if (!strcmp(command, "help") && (argc == 2 || (argc == 3 && resolve_command(argv[2])))) {
-        if (argc == 2) usage(stdout);
-        else command_help(stdout, resolve_command(argv[2]));
+    if (args.help) {
+        if (args.help_command == CMD_COUNT) usage(stdout);
+        else command_help(stdout, commands[args.help_command].name);
         return 0;
     }
-    if (argc == 3 && is_help(argv[2])) { command_help(stdout, command); return 0; }
     int rc;
-    if (argc == 2 && !strcmp(command, "list")) rc = list_instances(&err);
-    else if (!strcmp(command, "prune")) {
-        if (argc == 2) rc = prune_instances(false, &err);
-        else if (argc == 3 && !strcmp(argv[2], "--dry-run")) rc = prune_instances(true, &err);
-        else goto syntax;
-    }
-    else {
-        const char *name = argc > 2 ? argv[2] : "";
-        bool force = false;
-        uintmax_t tail_lines = 0;
-        const uintmax_t *tail = NULL;
-        bool follow = false;
-        int program_argc = 0;
-        char **program_argv = NULL;
-        if (!strcmp(command, "start") || !strcmp(command, "replace")) {
-            if (argc < 5 || strcmp(argv[3], "--") || !*argv[4]) goto syntax;
-            program_argc = argc - 4; program_argv = argv + 4;
-        } else if (!strcmp(command, "restart")) {
-            if (argc != 3) goto syntax;
-        } else if (!strcmp(command, "remove")) {
-            if (argc == 4 && !strcmp(argv[2], "--force")) { force = true; name = argv[3]; }
-            else if (argc == 4 && !strcmp(argv[3], "--force")) force = true;
-            else if (argc != 3) goto syntax;
-        } else if (!strcmp(command, "log")) {
-            bool named = false, saw_tail = false, saw_follow = false;
-            for (int i = 2; i < argc; ++i) {
-                const char *argument = argv[i];
-                if (!strcmp(argument, "-f") || !strcmp(argument, "--follow")) {
-                    if (saw_follow) goto syntax;
-                    saw_follow = follow = true;
-                } else if (!strcmp(argument, "--tail")) {
-                    if (saw_tail || i + 1 >= argc) goto syntax;
-                    saw_tail = true;
-                    const char *number = argv[++i];
-                    if (!*number || strspn(number, "0123456789") != strlen(number)) {
-                        fail(&err, "--tail requires a nonnegative integer"); goto syntax;
-                    }
-                    errno = 0;
-                    tail_lines = strtoumax(number, NULL, 10);
-                    if (errno == ERANGE) { fail(&err, "--tail count is too large"); goto syntax; }
-                    tail = &tail_lines;
-                } else if (!named && argument[0] != '-') {
-                    name = argument;
-                    named = true;
-                } else goto syntax;
-            }
-            if (!named) goto syntax;
-        } else if ((!strcmp(command, "stop") || !strcmp(command, "info")) && argc == 3) {
-            /* Name is an argument, even if it is also a subcommand word. */
-        } else goto syntax;
-        if (valid_name(name, &err)) goto syntax;
-        if (!strcmp(command, "log")) rc = log_instance(name, tail, follow, &err);
-        else if (!strcmp(command, "info")) rc = info_instance(name, &err);
-        else rc = mutate_instance(command, name, force, program_argc, program_argv, &err);
+    switch (args.command) {
+    case CMD_VERSION: printf("bgx %s\n", BGX_VERSION); return 0;
+    case CMD_LIST: rc = list_instances(&err); break;
+    case CMD_PRUNE: rc = prune_instances(args.dry_run, &err); break;
+    case CMD_INFO: rc = info_instance(args.name, &err); break;
+    case CMD_LOG:
+        rc = log_instance(args.name, args.has_tail ? &args.tail_lines : NULL, args.follow, &err);
+        break;
+    case CMD_START: case CMD_RESTART: case CMD_REPLACE: case CMD_STOP: case CMD_REMOVE:
+        rc = mutate_instance(commands[args.command].name, args.name, args.force,
+                             args.program_argc, args.program_argv, &err);
+        break;
+    default: return 2; /* Help and invalid commands are handled before execution. */
     }
     if (rc) fprintf(stderr, "bgx: %s\n", err.text[0] ? err.text : "operation failed");
     return rc ? 1 : 0;
-syntax:
-    fprintf(stderr, "bgx: %s\n\n", err.text[0] ? err.text : "invalid arguments");
-    usage(stderr);
-    return 2;
 }
