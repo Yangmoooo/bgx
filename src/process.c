@@ -23,7 +23,7 @@ const char *status_name(Status status) {
 }
 
 typedef struct { int stage; int error; } LaunchMessage;
-enum { READY, SESSION, REDIRECT, CHDIR, EXECUTING, EXECUTE };
+enum { READY, SESSION, REDIRECT, EXECUTING, EXECUTE };
 
 #ifndef BGX_LAUNCH_TIMEOUT_MS
 #define BGX_LAUNCH_TIMEOUT_MS 5000
@@ -197,7 +197,7 @@ int process_abort_launch(const Identity *id, Error *err) {
     return cleanup_child(id->pid, true, err) ? 0 : -1;
 }
 
-LaunchResult process_start(char *const argv[], int logfd, int cwdfd, ReleaseGuard guard, void *guard_context,
+LaunchResult process_start(char *const argv[], int logfd, ReleaseGuard guard, void *guard_context,
                            Identity *out, Error *err) {
     int status_pipe[2] = {-1, -1}, gate[2] = {-1, -1};
     pid_t pid = -1;
@@ -232,7 +232,6 @@ LaunchResult process_start(char *const argv[], int logfd, int cwdfd, ReleaseGuar
         close(status_pipe[0]); close(gate[1]);
         bgx_test_point("before_ready");
         if (setsid() < 0) { child_report(status_pipe[1], SESSION, errno); _exit(127); }
-        if (cwdfd >= 0 && fchdir(cwdfd) < 0) { child_report(status_pipe[1], CHDIR, errno); _exit(127); }
         if (dup2(input, STDIN_FILENO) < 0 || dup2(logfd, STDOUT_FILENO) < 0 || dup2(logfd, STDERR_FILENO) < 0) {
             child_report(status_pipe[1], REDIRECT, errno); _exit(127);
         }
@@ -372,7 +371,7 @@ failed:
             outcome = LAUNCH_UNCERTAIN;
             size_t used = strlen(err->text);
             snprintf(err->text + used, sizeof(err->text) - used,
-                     "; uncertain launch attempt retained (child PID %ld)%s%.120s",
+                     "; pending launch retained (child PID %ld)%s%.120s",
                      (long)pid, cleared ? "" : "; cleanup: ", cleared ? "" : cleanup.text);
         }
     }

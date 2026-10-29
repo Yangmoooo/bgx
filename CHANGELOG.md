@@ -5,10 +5,23 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- Omit the name in `start -- PROGRAM` to generate a unique name for each run.
+
 ### Changed
 
+- `start` prints the run's name and allows explicit reuse of exited names.
+  Reuse discards the old record and log, including when the new launch fails.
+- Startup failures retain their own diagnostics and log for inspection.
+- **Existing state must be cleared before upgrading.** Stop runs with the old
+  version and save any logs you need; there is no automatic migration.
 - Argument errors explain the problem and show the relevant command's usage.
 - Command help accepts `-h`/`--help` anywhere before `--`; program arguments after it remain unchanged.
+
+### Removed
+
+- `restart` and `replace`. Supply the command with `start` for each new run.
 
 ## [0.2.0] - 2026-10-11
 

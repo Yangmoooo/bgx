@@ -2,6 +2,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
@@ -89,6 +90,41 @@ int valid_name(const char *name, Error *err) {
         if (!alnum && (i == 0 || (c != '_' && c != '-')))
             return fail(err, "name must use ASCII letters, digits, '_' or '-', beginning with a letter or digit");
     }
+    return 0;
+}
+
+int generate_name(const char *program, char out[30], Error *err) {
+    const char *base = strrchr(program, '/');
+    base = base ? base + 1 : program;
+    size_t used = 0;
+    for (const unsigned char *p = (const unsigned char *)base; *p && used < 24; ++p) {
+        unsigned char c = *p;
+        if (c >= 'A' && c <= 'Z') c += 'a' - 'A';
+        bool alnum = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+        if (!used && !alnum) continue;
+        out[used++] = alnum || c == '_' || c == '-' ? (char)c : '-';
+    }
+    if (!used) { memcpy(out, "task", 4); used = 4; }
+    out[used++] = '-';
+    int fd = open("/dev/urandom", O_RDONLY | O_CLOEXEC);
+    if (fd < 0) return syserr(err, "open random source");
+    const char alphabet[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+    for (unsigned i = 0; i < 4;) {
+        unsigned char byte;
+        ssize_t n = read(fd, &byte, 1);
+        if (n < 0 && errno == EINTR) continue;
+        if (n != 1) {
+            if (n < 0) syserr(err, "read random source");
+            else fail(err, "random source ended unexpectedly");
+            close(fd);
+            return -1;
+        }
+        if (byte >= 252) continue; /* Rejection sampling avoids modulo bias. */
+        out[used++] = alphabet[byte % 36];
+        ++i;
+    }
+    close(fd);
+    out[used] = 0;
     return 0;
 }
 
