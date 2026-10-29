@@ -10,6 +10,8 @@ import tempfile
 import time
 import unittest
 
+from process_cleanup import kill_if_present
+
 TRUE = shutil.which("true")
 
 
@@ -32,10 +34,7 @@ class HandshakeTest(unittest.TestCase):
             if path.exists():
                 self.pids.add(int(path.read_text()))
         for pid in self.pids:
-            try:
-                os.kill(pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            kill_if_present(pid)
         if self.child:
             if self.child.poll() is None:
                 self.child.kill()

@@ -12,6 +12,8 @@ import tempfile
 import time
 import unittest
 
+from process_cleanup import kill_if_present
+
 BINARY = Path(os.environ.get("BGX_BIN", "build/bgx")).resolve()
 TRUE = shutil.which("true")
 
@@ -39,10 +41,7 @@ class BgxTest(unittest.TestCase):
             except subprocess.TimeoutExpired:
                 pass
         for pgid in self.groups:
-            try:
-                os.killpg(pgid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
+            kill_if_present(pgid, group=True)
         self.temp.cleanup()
 
     def cli(self, *args, expect=0, cwd=None, env=None, **kwargs):
