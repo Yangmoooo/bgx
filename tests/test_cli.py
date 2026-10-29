@@ -330,7 +330,7 @@ class BgxTest(unittest.TestCase):
             ("forget", "web"),
             ("prune", "web"), ("prune", "--dry-run", "web"),
             ("prune", "--dry-run", "--dry-run"), ("prune", "--force"),
-            ("completion", "bash"), ("logpath", "web"),
+            ("completion", "bash"), ("logpath", "web"), ("ps",), ("logs", "web"),
             ("-v",), ("up", "web", "--", "true"), ("down", "web"),
         ]:
             with self.subTest(args=args):
@@ -343,7 +343,7 @@ class BgxTest(unittest.TestCase):
     def test_argument_errors_explain_cause_and_show_local_usage(self):
         cases = [
             (("log", "web", "--tail"), "--tail requires a value", "log"),
-            (("logs", "web", "--tail", "-1"), "--tail requires a nonnegative integer", "log"),
+            (("log", "web", "--tail", "-1"), "--tail requires a nonnegative integer", "log"),
             (("log", "web", "--foo"), "unknown option: --foo", "log"),
             (("log", "web", "-f", "--follow"), "duplicate option: --follow", "log"),
             (("log", "web", "--tail", "1", "--tail", "2"), "duplicate option: --tail", "log"),
@@ -370,7 +370,7 @@ class BgxTest(unittest.TestCase):
         self.assertFalse(self.state.exists())
 
     def test_help_anywhere_before_separator_has_no_task_side_effects(self):
-        cases = [("log", ["web", "--tail", "10", "-f"]), ("logs", ["web", "--tail"]),
+        cases = [("log", ["web", "--tail", "10", "-f"]), ("log", ["web", "--tail"]),
                  ("start", ["web"]), ("s", ["web"]),
                  ("stop", ["web"]), ("info", ["web"]),
                  ("remove", ["web", "--force"]), ("prune", ["--dry-run"]),
@@ -569,8 +569,8 @@ class BgxTest(unittest.TestCase):
         for args in [(), ("-h",), ("--help",)]:
             self.assertEqual(self.cli(*args).stdout, general)
         commands = {"start": ["s"], "stop": [],
-                    "list": ["ls", "ps"], "info": [], "remove": ["rm"],
-                    "prune": [], "log": ["logs"], "help": ["-h", "--help"], "version": ["-V", "--version"]}
+                    "list": ["ls"], "info": [], "remove": ["rm"],
+                    "prune": [], "log": [], "help": ["-h", "--help"], "version": ["-V", "--version"]}
         for command, aliases in commands.items():
             with self.subTest(command=command):
                 specific = self.cli("help", command).stdout
@@ -581,7 +581,7 @@ class BgxTest(unittest.TestCase):
                     for args in [("help", name), (name, "-h"), (name, "--help")]:
                         self.assertEqual(self.cli(*args).stdout, specific, args)
         for alias in commands["help"]:
-            self.assertEqual(self.cli(alias, "logs").stdout, self.cli("help", "log").stdout)
+            self.assertEqual(self.cli(alias, "log").stdout, self.cli("help", "log").stdout)
         version = self.cli("version").stdout
         self.assertTrue(version.startswith(b"bgx "))
         for alias in commands["version"]:
@@ -600,10 +600,8 @@ class BgxTest(unittest.TestCase):
             self.cli("stop", "web")
             listed = self.cli("list").stdout
             self.assertIn(b"web", listed)
-            for alias in ["ls", "ps"]:
-                self.assertEqual(self.cli(alias).stdout, listed)
-            self.assertEqual(self.cli("logs", "web").stdout, self.cli("log", "web").stdout)
-            self.assertEqual(self.cli("logs", "web", "--tail", "1").stdout, b"ready\n")
+            self.assertEqual(self.cli("ls").stdout, listed)
+            self.assertEqual(self.cli("log", "web", "--tail", "1").stdout, b"ready\n")
             self.cli(removal, "web")
             self.assertFalse(self.directory().exists())
 
@@ -1001,12 +999,12 @@ class BgxTest(unittest.TestCase):
         self.expect_output(child, b"new\n")
         self.stop_follow(child)
 
-    def test_log_follow_accepts_options_before_or_after_name_and_logs_alias(self):
+    def test_log_follow_accepts_options_before_or_after_name(self):
         self.make_log(b"kept\n")
         for command in [["log", "-f", "web"],
                         ["log", "--tail", "1", "web", "-f"],
                         ["log", "web", "-f", "--tail", "1"],
-                        ["logs", "--follow", "web", "--tail", "1"]]:
+                        ["log", "--follow", "web", "--tail", "1"]]:
             with self.subTest(command=command):
                 child = self.spawn(command)
                 self.expect_output(child, b"kept\n")

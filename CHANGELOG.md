@@ -5,6 +5,14 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+
+- The `ps` and `logs` aliases; use `list`/`ls` and `log`.
+
+### Fixed
+
+- Align command descriptions and group related commands in help output.
+
 ## [0.3.0] - 2026-10-29
 
 ### Added

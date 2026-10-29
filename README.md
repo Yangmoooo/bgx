@@ -48,7 +48,8 @@ Uninstall with `make uninstall PREFIX="$HOME/.local"` (use your installation pre
 | `bgx help [COMMAND]` / `bgx version` | Show help or version |
 
 Use `bgx help COMMAND` or add `-h`/`--help` anywhere in a command's arguments
-before `--`. Everything after `--` in `start` belongs to the launched program.
+before `--`. Arguments after `--` in `start` are passed to the launched program;
+your shell still interprets unquoted shell syntax before bgx receives them.
 
 Names are case-sensitive, unique within a state directory, and contain 1–128 ASCII
 letters, digits, `_`, or `-`, beginning with a letter or digit. Without a name,
@@ -66,6 +67,66 @@ Every start uses the current directory and environment, disables terminal input,
 and combines stdout and stderr in one log. Success prints only the name to
 stdout. Errors go to stderr; launch errors include the name so retained records
 can be inspected. `s` is an alias for `start`.
+
+### Shell commands
+
+bgx executes a program directly. For pipelines, redirection, or command chains,
+use an explicit shell or a script:
+
+```sh
+bgx start pipeline -- sh -c 'producer | filter | consumer'
+bgx start build -- sh -c 'make && ./app'
+bgx start import -- sh -c 'processor < input.txt > output.txt'
+```
+
+In `bgx start -- producer | consumer`, only `producer` runs under bgx;
+`consumer` receives the name printed by bgx, not the producer's output.
+Likewise, an outer `> file` redirects bgx's name output, and an outer `< file`
+does not replace the background command's disabled stdin. Put these operators
+inside the shell command when they belong to the background work.
+
+Your current shell expands unquoted wildcards, variables, and command
+substitutions first. Single quotes around a `sh -c` command defer those
+expansions to that shell. For values containing spaces or shell characters,
+pass arguments instead of inserting them into shell code:
+
+```sh
+bgx start -- sh -c 'processor < "$1"' sh "$input_file"
+```
+
+Shell aliases, functions, and builtins are not standalone executables. Use a
+script or explicitly load their definitions in the appropriate shell; `sh -c`
+does not automatically inherit them. Keep commands in the foreground inside
+that shell; bgx already detaches them. `stop` targets the process group, normally
+including pipeline members; programs that detach themselves can escape it.
+When starting a shell, launch success confirms the shell executed, not that its
+pipeline or later commands succeeded. Check the log for their errors.
+
+### Environment variables
+
+Background commands inherit bgx's environment. To set variables for a command,
+use `env`, or set them before invoking bgx in your shell:
+
+```sh
+bgx start worker -- env MODE=prod TOKEN="$TOKEN" python3 worker.py
+MODE=prod bgx start worker -- python3 worker.py
+```
+
+Run these as alternatives. The first sets variables for the launched command;
+the second also sets them for bgx itself. Exported variables are inherited
+automatically; unexported shell variables are not.
+
+`bgx start worker -- MODE=prod python3 worker.py` does not work: bgx treats
+`MODE=prod` as the program name. For shell syntax, assignments can go inside the
+shell command instead:
+
+```sh
+bgx start worker -- sh -c 'MODE=prod python3 worker.py'
+```
+
+bgx records argv, but does not save a separate environment snapshot. Values
+passed through `env KEY=value` are part of argv and appear in saved metadata and
+command listings. Prefer inherited environment variables for sensitive values.
 
 ## Behavior and limits
 

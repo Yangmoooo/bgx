@@ -14,8 +14,8 @@
 #endif
 
 typedef enum {
-    CMD_START, CMD_STOP, CMD_LIST, CMD_INFO,
-    CMD_REMOVE, CMD_PRUNE, CMD_LOG, CMD_HELP, CMD_VERSION, CMD_COUNT
+    CMD_START, CMD_STOP, CMD_LIST, CMD_INFO, CMD_LOG,
+    CMD_REMOVE, CMD_PRUNE, CMD_HELP, CMD_VERSION, CMD_COUNT
 } Command;
 
 static const struct {
@@ -34,7 +34,7 @@ static const struct {
     [CMD_STOP] = {"stop", "stop NAME", "Stop a background command and its process group.",
      "Send TERM, wait up to 5 seconds, then KILL if needed. Keep the record and log.\n", {NULL}},
     [CMD_LIST] = {"list", "list", "List background commands and their status.",
-     "Show name, status, PID, uptime, and command.\n", {"ls", "ps"}},
+     "Show name, status, PID, uptime, and command.\n", {"ls"}},
     [CMD_INFO] = {"info", "info NAME", "Show a task's record and current status.",
      "Show recorded process IDs, local start time, uptime, directory, command, and log path.\n"
      "Recorded IDs are historical metadata, not proof that a process is still running.\n"
@@ -51,7 +51,7 @@ static const struct {
      "Print the full log by default, or the last N lines with --tail N.\n"
      "N must be a nonnegative integer; 0 prints nothing.\n"
      "-f/--follow keeps printing appended output until interrupted or the output closes.\n"
-     "A follow session stays with the log opened for this execution, even after the name is reused.\n", {"logs"}},
+     "A follow session stays with the log opened for this execution, even after the name is reused.\n", {NULL}},
     [CMD_HELP] = {"help", "help [COMMAND]", "Show general or command-specific help.", "", {"-h", "--help"}},
     [CMD_VERSION] = {"version", "version", "Show the bgx version.", "", {"-V", "--version"}},
 };
@@ -65,10 +65,16 @@ static void print_aliases(FILE *out, size_t index) {
 }
 
 static void usage(FILE *out) {
-    fputs("bgx - named background commands\n\n"
+    size_t width = 0;
+    for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); ++i) {
+        size_t length = strlen(commands[i].syntax);
+        if (length > width) width = length;
+    }
+    fputs("bgx - Run and manage background commands\n\n"
           "Usage:\n", out);
     for (size_t i = 0; i < sizeof(commands) / sizeof(commands[0]); ++i) {
-        fprintf(out, "  bgx %-32s %s", commands[i].syntax, commands[i].description);
+        if (i == CMD_LIST || i == CMD_REMOVE || i == CMD_HELP) fputc('\n', out);
+        fprintf(out, "  bgx %-*s  %s", (int)width, commands[i].syntax, commands[i].description);
         print_aliases(out, i);
         fputc('\n', out);
     }
