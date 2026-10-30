@@ -31,8 +31,10 @@ static const struct {
      "the previous record and log, even if the new command fails to start.\n"
      "The command inherits the current directory and environment.\n"
      "Output is logged; terminal input is disabled.\n", {"s"}},
-    [CMD_STOP] = {"stop", "stop NAME [NAME...]", "Stop background commands and their process groups.",
+    [CMD_STOP] = {"stop", "stop NAME [NAME...] | stop --all", "Stop background commands and their process groups.",
      "Send TERM, wait up to 5 seconds, then KILL if needed. Keep records and logs.\n"
+     "--all selects all recorded names in the current state directory; do not combine it with names.\n"
+     "Already-exited runs are harmless; stale, unknown, or unreadable records report errors.\n"
      "Process names in order, continuing after errors; any failure makes the command exit nonzero.\n", {NULL}},
     [CMD_RENAME] = {"rename", "rename OLD NEW", "Rename a run, keeping its process and log.",
      "The new name must be unused. The old name stops working after a successful rename.\n"
@@ -109,7 +111,7 @@ static bool is_help(const char *arg) { return !strcmp(arg, "--help") || !strcmp(
 
 typedef struct {
     Command command;
-    bool help, force, follow, dry_run, has_tail;
+    bool help, force, follow, dry_run, has_tail, all;
     Command help_command;
     const char *name;
     const char *new_name;
@@ -175,6 +177,7 @@ static int parse_arguments(int argc, char **argv, Arguments *out, Error *err) {
         const char *arg = argv[i];
         bool *flag = NULL;
         if (command == CMD_REMOVE && !strcmp(arg, "--force")) flag = &out->force;
+        else if (command == CMD_STOP && !strcmp(arg, "--all")) flag = &out->all;
         else if (command == CMD_PRUNE && !strcmp(arg, "--dry-run")) flag = &out->dry_run;
         else if (command == CMD_LOG && (!strcmp(arg, "-f") || !strcmp(arg, "--follow"))) flag = &out->follow;
         if (flag) {
@@ -196,6 +199,10 @@ static int parse_arguments(int argc, char **argv, Arguments *out, Error *err) {
             if (valid_name(arg, err)) return -1;
             out->name = arg;
         }
+    }
+    if (out->all) {
+        if (out->name) return fail(err, "--all cannot be combined with task names");
+        return 0;
     }
     if (needs_name) {
         if (!out->name) return fail(err, "missing task name");
@@ -566,6 +573,43 @@ static int mutate_names(const Arguments *args) {
     return failed ? 1 : 0;
 }
 
+static int stop_all(Error *err) {
+    Store s;
+    int opened = store_open(&s, false, err);
+    if (opened < 0) return -1;
+    if (opened == 1) return 0;
+    char **names = NULL;
+    size_t count = 0;
+    /* A partial enumeration must never authorize a partial stop-all. */
+    int rc = store_names(&s, &names, &count, err);
+    if (!rc && count) rc = store_open_locks(&s, err);
+    bool failed = false;
+    if (!rc) bgx_test_point("stop_all_enumerated");
+    for (size_t i = 0; !rc && i < count; ++i) {
+        Error detail = {0};
+        int lock = store_lock(&s, names[i], &detail);
+        int stopped = -1;
+        if (lock >= 0) {
+            Record record;
+            int loaded = store_load(&s, names[i], &record, &detail);
+            /* A concurrently removed/renamed entry needs no further action. */
+            stopped = loaded == 1 ? 0 : loaded;
+            if (!loaded) stopped = stop_locked(&s, names[i], &record, &detail);
+            record_free(&record);
+            close(lock);
+        }
+        if (stopped) {
+            fprintf(stderr, "bgx: %s: %s\n", names[i], detail.text);
+            failed = true;
+        }
+    }
+    for (size_t i = 0; i < count; ++i) free(names[i]);
+    free(names);
+    store_close(&s);
+    if (rc) return -1;
+    return failed ? fail(err, "some runs could not be stopped") : 0;
+}
+
 static int rename_instance(const char *name, const char *new_name, Error *err) {
     Store s;
     int opened = store_open(&s, false, err);
@@ -767,7 +811,11 @@ int main(int argc, char **argv) {
     case CMD_LOG:
         rc = log_instance(args.name, args.has_tail ? &args.tail_lines : NULL, args.follow, &err);
         break;
-    case CMD_STOP: case CMD_REMOVE: return mutate_names(&args);
+    case CMD_STOP:
+        if (!args.all) return mutate_names(&args);
+        rc = stop_all(&err);
+        break;
+    case CMD_REMOVE: return mutate_names(&args);
     case CMD_RENAME: rc = rename_instance(args.name, args.new_name, &err); break;
     case CMD_START:
         rc = mutate_instance(args.command, args.name, args.force,

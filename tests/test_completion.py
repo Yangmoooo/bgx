@@ -86,6 +86,10 @@ class CompletionTest(unittest.TestCase):
                  (("log", "-f", "-"), {"-h", "--help", "--tail"}),
                  (("rm", "-"), {"-h", "--help", "--force"}),
                  (("rm", "--force", "-"), {"-h", "--help"}),
+                 (("stop", "-"), {"-h", "--help", "--all"}),
+                 (("stop", "web", "-"), {"-h", "--help"}),
+                 (("stop", "--all", ""), {"-h", "--help"}),
+                 (("stop", "--all", "--a"), set()),
                  (("prune", "--dry-run", "-"), {"-h", "--help"}),
                  (("list", "-"), {"-h", "--help"}),
                  (("ps", ""), set()), (("logs", ""), set())]
@@ -105,6 +109,7 @@ class CompletionTest(unittest.TestCase):
                  (("log", "web", "w"), set()),
                  (("start", "w"), set()),
                  (("stop", "web", "w"), {"worker"}),
+                 (("stop", "--all", "w"), set()),
                  (("remove", "--force", "web", "w"), {"worker"}),
                  (("rm", "Web", "web", "w"), {"worker"}),
                  (("log", "--tail", "5", "w"), {"web", "worker"}),

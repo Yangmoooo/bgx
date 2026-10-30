@@ -3,7 +3,7 @@ _bgx_complete() {
   local IFS=$' \t\n'
   local cur=${COMP_WORDS[COMP_CWORD]} cmd=${COMP_WORDS[1]} word name rest candidate
   local i count=0 tail_value=0 has_tail=0 has_follow=0 has_force=0 has_dry_run=0
-  local selected=' ' want_names=0 header=1
+  local selected=' ' want_names=0 header=1 has_all=0
   local subcommands='start s stop rename list ls info log remove rm prune help version -h --help -V --version'
   local -a candidates
   COMPREPLY=()
@@ -22,6 +22,7 @@ _bgx_complete() {
       if ((tail_value)); then tail_value=0; continue; fi
       case $word in
         -h|--help) return 0 ;;
+        --all) has_all=1 ;;
         --tail) has_tail=1; tail_value=1 ;;
         -f|--follow) has_follow=1 ;;
         --force) has_force=1 ;;
@@ -33,7 +34,13 @@ _bgx_complete() {
     ((tail_value)) && return 0
     case $cmd in
       start|s) ((count <= 1)) && candidates=(-- -h --help) ;;
-      stop) want_names=1; candidates=(-h --help) ;;
+      stop)
+        candidates=(-h --help)
+        if ((!has_all)); then
+          want_names=1
+          ((count)) || candidates+=(--all)
+        fi
+        ;;
       remove|rm)
         want_names=1; candidates=(-h --help)
         ((has_force)) || candidates+=(--force)

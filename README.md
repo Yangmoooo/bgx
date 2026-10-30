@@ -111,6 +111,7 @@ files. Neither method stops runs or removes their state directory.
 | `bgx info NAME` | Show task details, launch diagnostics, and log paths |
 | `bgx log NAME [--tail N] [-f]` | Print all or the last N lines; `-f`/`--follow` streams new output |
 | `bgx stop NAME [NAME...]` | Stop runs, keeping their records and logs |
+| `bgx stop --all` | Stop all safely identifiable runs in the current state directory |
 | `bgx rename OLD NEW` | Change a run's name without restarting it or replacing its log |
 | `bgx remove NAME [NAME...]` | Delete exited runs' records and logs |
 | `bgx remove NAME [NAME...] --force` | Delete data only; **does not stop processes** |
@@ -154,6 +155,13 @@ bgx remove web worker
 Any failure produces a nonzero exit status; completed operations are not rolled
 back. Syntax errors are rejected before any operation. `remove --force` applies
 to every supplied name. `ls` and `rm` are aliases for `list` and `remove`.
+
+`stop --all` takes a list of recorded names, then checks and stops each under its
+name lock. It keeps all records and logs, succeeds if there is nothing to stop,
+and continues after errors. Stale, unknown, or unreadable records are reported
+without signalling their processes and make the command exit nonzero. Names
+added after enumeration are not included; names removed or renamed before their
+turn are skipped. Do not combine `--all` with explicit names.
 
 ### Shell commands
 
@@ -257,6 +265,9 @@ Names are encoded to stay distinct on case-insensitive filesystems. The director
 is the sole source of the name; `meta.json` does not duplicate it. Records and
 logs remain until removal or explicit name reuse; `prune --dry-run` previews
 cleanup of exited runs. Lock files remain to coordinate concurrent commands.
+An existing lock file does not mean a run is active or the lock is held. Removing
+it while commands are running could let two commands acquire different locks for
+the same name, so `remove` and `prune` deliberately leave these empty files behind.
 
 **Schema 4 is incompatible with earlier formats.** Before upgrading, use the old
 version to stop tasks, verify their processes ended, delete the selected state

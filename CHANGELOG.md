@@ -5,6 +5,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `stop --all` stops recorded runs while keeping their records and logs.
+
 ## [0.4.0] - 2026-10-30
 
 ### Added

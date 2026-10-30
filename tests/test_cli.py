@@ -393,6 +393,127 @@ class BgxTest(unittest.TestCase):
         self.save(original)
         self.cli("stop", "web")
 
+    def test_stop_all_preserves_records_and_logs(self):
+        self.start("web")
+        self.start("Web")
+        self.start("ended")
+        self.cli("stop", "ended")
+        self.cli("start", "failed", "--", str(self.base / "missing"), expect=1)
+        before = {name: (self.record(name), self.log_path(name).read_bytes())
+                  for name in ["web", "Web", "ended", "failed"]}
+        result = self.cli("stop", "--all")
+        self.assertEqual(result.stdout, b"")
+        self.assertEqual(result.stderr, b"")
+        for name, (record, log) in before.items():
+            record["exited"] = True
+            self.assertEqual(self.record(name), record)
+            self.assertEqual(self.log_path(name).read_bytes(), log)
+        self.cli("stop", "--all")  # Idempotent.
+
+    def test_stop_all_empty_state_and_invalid_arguments_have_no_side_effects(self):
+        self.cli("stop", "--all")
+        self.assertFalse(self.state.exists())
+        for args in [("stop", "--all", "web"), ("stop", "web", "--all"),
+                     ("stop", "--all", "--all"), ("stop", "--all", "--force"),
+                     ("rm", "--all")]:
+            self.cli(*args, expect=2)
+        self.assertFalse(self.state.exists())
+        (self.state / "instances").mkdir(parents=True)
+        self.cli("stop", "--all")
+        self.assertFalse((self.state / "locks").exists())
+        self.start()
+        before = self.record()
+        self.cli("stop", "--all", "web", expect=2)
+        self.cli("stop", "--all", "--help")
+        self.assertEqual(self.record(), before)
+        self.assertIn(b"running", self.cli("info", "web").stdout)
+
+    def test_stop_all_continues_past_unsafe_records_and_lock_errors(self):
+        for name in ["aaa", "broken", "locked", "pending", "stale", "zzz"]:
+            self.start(name)
+        originals = {name: self.record(name) for name in ["broken", "locked", "pending", "stale"]}
+        (self.directory("broken") / "meta.json").write_text("{broken")
+        pending = deepcopy(originals["pending"])
+        pending["launch"] = "pending"
+        self.save(pending, "pending")
+        stale = deepcopy(originals["stale"])
+        stale["process_identity"]["start_marker"] += "-wrong"
+        self.save(stale, "stale")
+        lock = self.state / "locks/locked.lock"
+        lock.unlink()
+        lock.mkdir()
+        result = self.cli("stop", "--all", expect=1)
+        for name, record in originals.items():
+            self.assertIn(f"bgx: {name}:".encode(), result.stderr)
+            os.kill(record["process_identity"]["pid"], 0)
+        self.assertTrue(self.record("aaa")["exited"])
+        self.assertTrue(self.record("zzz")["exited"])
+
+    def test_stop_all_enumeration_failure_stops_nothing(self):
+        self.start()
+        (self.state / "instances/bad.name").mkdir()
+        self.cli("stop", "--all", expect=1)
+        self.assertIn(b"running", self.cli("info", "web").stdout)
+
+    def test_stop_all_uses_selected_state_directory(self):
+        self.start()
+        other = self.base / "other-state"
+        env = dict(self.env, BGX_STATE_HOME=str(other))
+        self.cli("start", "other", "--", "/bin/sleep", "120", env=env)
+        path = other / "instances/other/meta.json"
+        record = json.loads(path.read_text())
+        self.groups.add(record["process_identity"]["pid"])
+        self.cli("stop", "--all", env=env)
+        self.assertTrue(json.loads(path.read_text())["exited"])
+        self.assertIn(b"running", self.cli("info", "web").stdout)
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_stop_all_rechecks_under_lock_and_uses_initial_name_list(self):
+        import fcntl
+        self.start("aaa")
+        self.start("gone")
+        self.start("moved")
+        notice = self.base / "all-notice"
+        child = subprocess.Popen([os.environ["BGX_FAULT_BIN"], "stop", "--all"],
+                                 env=dict(self.env, BGX_TEST_POINT="stop_all_enumerated",
+                                          BGX_TEST_NOTIFY=str(notice)),
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.followers.append(child)
+        self.wait_test_point(child, notice)
+        self.cli("stop", "gone")
+        self.cli("rm", "gone")
+        self.cli("rename", "moved", "renamed")
+        self.start("new")
+        original = self.record("aaa")
+        pending = deepcopy(original)
+        pending["launch"] = "pending"
+        with (self.state / "locks/aaa.lock").open("rb") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            os.kill(child.pid, signal.SIGCONT)
+            self.wait_for_name_lock(child, lock)
+            self.save(pending, "aaa")
+        out, err = child.communicate(timeout=5)
+        self.assertEqual(child.returncode, 1, (out, err))
+        self.assertIn(b"bgx: aaa:", err)
+        self.assertNotIn(b"bgx: gone:", err)
+        self.assertNotIn(b"bgx: moved:", err)
+        self.assertEqual(self.record("aaa"), pending)
+        os.kill(original["process_identity"]["pid"], 0)
+        for name in ["new", "renamed"]:
+            self.assertIn(b"running", self.cli("info", name).stdout)
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_stop_all_reports_process_stop_failures(self):
+        for name in ["one", "two"]:
+            self.start(name)
+        result = subprocess.run([os.environ["BGX_FAULT_BIN"], "stop", "--all"],
+                                env=dict(self.env, BGX_TEST_FAULT="stop_failure"),
+                                capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 1)
+        for name in ["one", "two"]:
+            self.assertIn(f"bgx: {name}: injected stop failure".encode(), result.stderr)
+            self.assertIn(b"running", self.cli("info", name).stdout)
+
     def test_batch_stop_and_remove_continue_after_named_errors(self):
         self.start("one")
         stale = self.start("stale")
