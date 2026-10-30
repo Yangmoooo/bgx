@@ -41,10 +41,10 @@ Uninstall with `make uninstall PREFIX="$HOME/.local"` (use your installation pre
 | `bgx list` | Show names, status, PIDs, uptime, and commands |
 | `bgx info NAME` | Show task details, launch diagnostics, and log paths |
 | `bgx log NAME [--tail N] [-f]` | Print all or the last N lines; `-f`/`--follow` streams new output |
-| `bgx stop NAME` | Stop a task, keeping its record and log |
+| `bgx stop NAME [NAME...]` | Stop runs, keeping their records and logs |
 | `bgx rename OLD NEW` | Change a run's name without restarting it or replacing its log |
-| `bgx remove NAME` | Delete an exited task's record and log |
-| `bgx remove NAME --force` | Delete data only; **does not stop processes** |
+| `bgx remove NAME [NAME...]` | Delete exited runs' records and logs |
+| `bgx remove NAME [NAME...] --force` | Delete data only; **does not stop processes** |
 | `bgx prune [--dry-run]` | Delete all exited tasks, or preview the selection |
 | `bgx help [COMMAND]` / `bgx version` | Show help or version |
 
@@ -77,9 +77,14 @@ continue following the same file. Renaming a valid run to its current name is a 
 
 ```sh
 bgx rename python3-k7m2 worker
-bgx stop worker
-bgx remove worker
+bgx stop web worker
+bgx remove web worker
 ```
+
+`stop` and `remove` process names in order and continue after individual errors.
+Any failure produces a nonzero exit status; completed operations are not rolled
+back. Syntax errors are rejected before any operation. `remove --force` applies
+to every supplied name. `ls` and `rm` are aliases for `list` and `remove`.
 
 ### Shell commands
 

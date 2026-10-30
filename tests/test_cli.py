@@ -393,8 +393,49 @@ class BgxTest(unittest.TestCase):
         self.save(original)
         self.cli("stop", "web")
 
+    def test_batch_stop_and_remove_continue_after_named_errors(self):
+        self.start("one")
+        stale = self.start("stale")
+        changed = deepcopy(stale)
+        changed["process_identity"]["start_marker"] += "-wrong"
+        self.save(changed, "stale")
+        self.start("two")
+        result = self.cli("stop", "one", "missing", "stale", "two", expect=1)
+        self.assertIn(b"bgx: missing:", result.stderr)
+        self.assertIn(b"bgx: stale:", result.stderr)
+        self.assertTrue(self.record("one")["exited"])
+        self.assertTrue(self.record("two")["exited"])
+        os.kill(stale["process_identity"]["pid"], 0)
+        result = self.cli("rm", "one", "missing", "stale", "two", expect=1)
+        self.assertIn(b"bgx: missing:", result.stderr)
+        self.assertFalse(self.directory("one").exists())
+        self.assertFalse(self.directory("two").exists())
+        self.assertTrue(self.directory("stale").exists())
+        self.save(stale, "stale")
+        self.cli("stop", "stale")
 
+    def test_batch_force_applies_to_all_names_without_signals(self):
+        for position in range(3):
+            one, two = self.start("one"), self.start("two")
+            args = ["one", "two"]
+            args.insert(position, "--force")
+            self.cli("rm", *args)
+            for name, record in [("one", one), ("two", two)]:
+                self.assertFalse(self.directory(name).exists())
+                os.kill(record["process_identity"]["pid"], 0)
 
+    def test_batch_syntax_errors_do_not_partially_mutate(self):
+        self.start("one")
+        for args in [("stop", "one", "bad.name"), ("stop", "one", "--force"),
+                     ("rm", "one", "--force", "bad/name"),
+                     ("rm", "--force", "one", "--force")]:
+            self.cli(*args, expect=2)
+            self.assertIn(b"running", self.cli("info", "one").stdout)
+        for args in [("rename",), ("rename", "one"), ("rename", "one", "new", "extra"),
+                     ("rename", "one", "bad.name")]:
+            self.cli(*args, expect=2)
+        self.cli("stop", "one", "one")
+        self.cli("rm", "one")
 
     @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
     def test_rename_crash_keeps_one_complete_directory(self):

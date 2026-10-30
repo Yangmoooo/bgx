@@ -31,8 +31,9 @@ static const struct {
      "the previous record and log, even if the new command fails to start.\n"
      "The command inherits the current directory and environment.\n"
      "Output is logged; terminal input is disabled.\n", {"s"}},
-    [CMD_STOP] = {"stop", "stop NAME", "Stop a background command and its process group.",
-     "Send TERM, wait up to 5 seconds, then KILL if needed. Keep the record and log.\n", {NULL}},
+    [CMD_STOP] = {"stop", "stop NAME [NAME...]", "Stop background commands and their process groups.",
+     "Send TERM, wait up to 5 seconds, then KILL if needed. Keep records and logs.\n"
+     "Process names in order, continuing after errors; any failure makes the command exit nonzero.\n", {NULL}},
     [CMD_RENAME] = {"rename", "rename OLD NEW", "Rename a run, keeping its process and log.",
      "The new name must be unused. The old name stops working after a successful rename.\n"
      "Running and exited runs can be renamed; stale, unknown, and invalid records are refused.\n", {NULL}},
@@ -42,8 +43,9 @@ static const struct {
      "Show recorded process IDs, local start time, uptime, directory, command, and log path.\n"
      "Recorded IDs are historical metadata, not proof that a process is still running.\n"
      "Startup failures include their diagnostics; pending launches have unknown status.\n", {NULL}},
-    [CMD_REMOVE] = {"remove", "remove NAME [--force]", "Remove a command's record and log.",
-     "The command must have exited. --force deletes data without stopping any processes.\n", {"rm"}},
+    [CMD_REMOVE] = {"remove", "remove NAME [NAME...] [--force]", "Remove run records and logs.",
+     "Runs must have exited. --force applies to every name and deletes data without stopping processes.\n"
+     "Process names in order, continuing after errors; any failure makes the command exit nonzero.\n", {"rm"}},
     [CMD_PRUNE] = {"prune", "prune [--dry-run]", "Remove records and logs for tasks that have exited.",
      "Only tasks assessed as exited qualify; running tasks are skipped silently and no\n"
      "processes are signalled. Stale or unknown identity, unreadable records, and failed\n"
@@ -111,6 +113,8 @@ typedef struct {
     Command help_command;
     const char *name;
     const char *new_name;
+    int names_argc;
+    char **names_argv; /* Validated operands, possibly interspersed with --force. */
     uintmax_t tail_lines;
     int program_argc;
     char **program_argv;
@@ -163,6 +167,8 @@ static int parse_arguments(int argc, char **argv, Arguments *out, Error *err) {
         out->new_name = argv[3];
         return valid_name(out->name, err) || valid_name(out->new_name, err) ? -1 : 0;
     }
+    bool multiple = command == CMD_STOP || command == CMD_REMOVE;
+    if (multiple) { out->names_argc = argc - 2; out->names_argv = argv + 2; }
     bool needs_name = command == CMD_STOP || command == CMD_INFO ||
                       command == CMD_REMOVE || command == CMD_LOG;
     for (int i = 2; i < argc; ++i) {
@@ -185,8 +191,11 @@ static int parse_arguments(int argc, char **argv, Arguments *out, Error *err) {
             if (errno == ERANGE) return fail(err, "--tail count is too large");
             out->has_tail = true;
         } else if (arg[0] == '-') return fail(err, "unknown option: %s", arg);
-        else if (!needs_name || out->name) return fail(err, "unexpected argument: %s", arg);
-        else out->name = arg;
+        else if (!needs_name || (out->name && !multiple)) return fail(err, "unexpected argument: %s", arg);
+        else {
+            if (valid_name(arg, err)) return -1;
+            out->name = arg;
+        }
     }
     if (needs_name) {
         if (!out->name) return fail(err, "missing task name");
@@ -512,7 +521,6 @@ static int mutate_instance(Command command, const char *name, bool force,
     }
     if (lock < 0) { fail(err, "could not allocate an unused name"); goto done; }
     if (command == CMD_REMOVE && force) {
-        fputs("bgx: --force deletes the record and log only; no processes will be stopped; old processes may still be running.\n", stderr);
         rc = store_remove(&s, name, err);
     } else {
         Record record;
@@ -540,6 +548,22 @@ done:
     if (lock >= 0) close(lock);
     store_close(&s);
     return rc;
+}
+
+static int mutate_names(const Arguments *args) {
+    bool failed = false;
+    if (args->force)
+        fputs("bgx: --force deletes records and logs only; no processes will be stopped; old processes may still be running.\n", stderr);
+    for (int i = 0; i < args->names_argc; ++i) {
+        const char *name = args->names_argv[i];
+        if (!strcmp(name, "--force")) continue;
+        Error detail = {0};
+        if (mutate_instance(args->command, name, args->force, 0, NULL, &detail)) {
+            fprintf(stderr, "bgx: %s: %s\n", name, detail.text);
+            failed = true;
+        }
+    }
+    return failed ? 1 : 0;
 }
 
 static int rename_instance(const char *name, const char *new_name, Error *err) {
@@ -743,8 +767,9 @@ int main(int argc, char **argv) {
     case CMD_LOG:
         rc = log_instance(args.name, args.has_tail ? &args.tail_lines : NULL, args.follow, &err);
         break;
+    case CMD_STOP: case CMD_REMOVE: return mutate_names(&args);
     case CMD_RENAME: rc = rename_instance(args.name, args.new_name, &err); break;
-    case CMD_START: case CMD_STOP: case CMD_REMOVE:
+    case CMD_START:
         rc = mutate_instance(args.command, args.name, args.force,
                              args.program_argc, args.program_argv, &err);
         break;
