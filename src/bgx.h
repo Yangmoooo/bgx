@@ -8,7 +8,7 @@
 #include <sys/types.h>
 #include <time.h>
 
-#define BGX_SCHEMA 3
+#define BGX_SCHEMA 4
 #define BGX_MAX_META (8u * 1024u * 1024u)
 #define BGX_LOG_FILE "output.log"
 
@@ -76,6 +76,8 @@ int store_load(Store *s, const char *name, Record *record, Error *err); /* 1: ab
 int store_exists(Store *s, const char *name, Error *err); /* 1: any entry, 0: absent, -1: error */
 int store_create_log(Store *s, const char *name, Error *err); /* owned fd or -1 */
 int store_remove(Store *s, const char *name, Error *err);
+/* Caller holds both name locks; target must be absent. */
+int store_rename(Store *s, const char *name, const char *new_name, Error *err);
 int store_log(Store *s, const char *name, Error *err); /* owned fd or -1 */
 char *store_log_path(Store *s, const char *name, Error *err); /* owned absolute path */
 int store_names(Store *s, char ***names, size_t *count, Error *err);

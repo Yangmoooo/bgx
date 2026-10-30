@@ -14,7 +14,7 @@
 #endif
 
 typedef enum {
-    CMD_START, CMD_STOP, CMD_LIST, CMD_INFO, CMD_LOG,
+    CMD_START, CMD_STOP, CMD_RENAME, CMD_LIST, CMD_INFO, CMD_LOG,
     CMD_REMOVE, CMD_PRUNE, CMD_HELP, CMD_VERSION, CMD_COUNT
 } Command;
 
@@ -33,6 +33,9 @@ static const struct {
      "Output is logged; terminal input is disabled.\n", {"s"}},
     [CMD_STOP] = {"stop", "stop NAME", "Stop a background command and its process group.",
      "Send TERM, wait up to 5 seconds, then KILL if needed. Keep the record and log.\n", {NULL}},
+    [CMD_RENAME] = {"rename", "rename OLD NEW", "Rename a run, keeping its process and log.",
+     "The new name must be unused. The old name stops working after a successful rename.\n"
+     "Running and exited runs can be renamed; stale, unknown, and invalid records are refused.\n", {NULL}},
     [CMD_LIST] = {"list", "list", "List background commands and their status.",
      "Show name, status, PID, uptime, and command.\n", {"ls"}},
     [CMD_INFO] = {"info", "info NAME", "Show a task's record and current status.",
@@ -107,6 +110,7 @@ typedef struct {
     bool help, force, follow, dry_run, has_tail;
     Command help_command;
     const char *name;
+    const char *new_name;
     uintmax_t tail_lines;
     int program_argc;
     char **program_argv;
@@ -150,6 +154,14 @@ static int parse_arguments(int argc, char **argv, Arguments *out, Error *err) {
         out->program_argc = argc - separator - 1;
         out->program_argv = argv + separator + 1;
         return 0;
+    }
+    if (command == CMD_RENAME) {
+        if (argc < 3) return fail(err, "missing old name");
+        if (argc < 4) return fail(err, "missing new name");
+        if (argc > 4) return fail(err, "unexpected argument: %s", argv[4]);
+        out->name = argv[2];
+        out->new_name = argv[3];
+        return valid_name(out->name, err) || valid_name(out->new_name, err) ? -1 : 0;
     }
     bool needs_name = command == CMD_STOP || command == CMD_INFO ||
                       command == CMD_REMOVE || command == CMD_LOG;
@@ -530,6 +542,36 @@ done:
     return rc;
 }
 
+static int rename_instance(const char *name, const char *new_name, Error *err) {
+    Store s;
+    int opened = store_open(&s, false, err);
+    if (opened < 0) return -1;
+    if (opened == 1) return fail(err, "instance not found: %s", name);
+    int first = -1, second = -1, rc = -1;
+    Record record = {0};
+    if (store_open_locks(&s, err)) goto done;
+    /* Every rename takes the pair in the same order, including opposite moves. */
+    bool ordered = strcmp(name, new_name) < 0;
+    first = store_lock(&s, ordered ? name : new_name, err);
+    if (first < 0) goto done;
+    if (strcmp(name, new_name)) {
+        second = store_lock(&s, ordered ? new_name : name, err);
+        if (second < 0) goto done;
+    }
+    int loaded = store_load(&s, name, &record, err);
+    if (loaded < 0) goto done;
+    if (loaded == 1) { fail(err, "instance not found: %s", name); goto done; }
+    Status state = task_status(&record, err);
+    if (state != RUNNING && state != EXITED) { unsafe_status(name, state, err); goto done; }
+    rc = !strcmp(name, new_name) ? 0 : store_rename(&s, name, new_name, err);
+done:
+    record_free(&record);
+    if (second >= 0) close(second);
+    if (first >= 0) close(first);
+    store_close(&s);
+    return rc;
+}
+
 /* Per-task prune problems are named and make the batch exit nonzero without
    stopping later candidates. */
 static void prune_name_error(const char *name, const char *message) {
@@ -701,6 +743,7 @@ int main(int argc, char **argv) {
     case CMD_LOG:
         rc = log_instance(args.name, args.has_tail ? &args.tail_lines : NULL, args.follow, &err);
         break;
+    case CMD_RENAME: rc = rename_instance(args.name, args.new_name, &err); break;
     case CMD_START: case CMD_STOP: case CMD_REMOVE:
         rc = mutate_instance(args.command, args.name, args.force,
                              args.program_argc, args.program_argv, &err);

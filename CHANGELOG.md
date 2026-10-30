@@ -5,6 +5,15 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- `rename OLD NEW` changes a run's name while keeping its process and log.
+
+### Changed
+
+- **Existing state must be cleared before upgrading.** Stop runs with the old
+  version and save any logs you need; there is no automatic migration.
+
 ### Removed
 
 - The `ps` and `logs` aliases; use `list`/`ls` and `log`.

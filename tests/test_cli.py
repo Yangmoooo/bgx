@@ -56,7 +56,14 @@ class BgxTest(unittest.TestCase):
         return result
 
     def directory(self, name="web"):
-        return self.state / "instances" / name
+        bitmap = [0] * ((len(name) + 3) // 4)
+        for i, char in enumerate(name):
+            if "A" <= char <= "Z":
+                bitmap[i // 4] |= 1 << (i % 4)
+        key = name.lower()
+        if any(bitmap):
+            key += "." + "".join(format(value, "x") for value in bitmap)
+        return self.state / "instances" / key
 
     def record(self, name="web"):
         return json.loads((self.directory(name) / "meta.json").read_text())
@@ -65,12 +72,8 @@ class BgxTest(unittest.TestCase):
         return self.directory(name) / "output.log"
 
     def stored_record(self, name):
-        for path in (self.state / "instances").iterdir():
-            record = json.loads((path / "meta.json").read_text())
-            if record["name"] == name:
-                self.groups.add(record["process_identity"]["pid"])
-                return path, record
-        self.fail(f"no record for {name!r}")
+        record = self.track(name)
+        return self.directory(name), record
 
     def save(self, value, name="web"):
         (self.directory(name) / "meta.json").write_text(json.dumps(value))
@@ -296,7 +299,7 @@ class BgxTest(unittest.TestCase):
     def test_old_and_incomplete_records_are_never_reinterpreted(self):
         self.make_log(b"keep\n")
         original = self.record()
-        for changes in [{"schema_version": 2}, {"launch": "prepared"},
+        for changes in [{"schema_version": 3}, {"name": "web"}, {"launch": "prepared"},
                         {"launch": "pending", "exited": True},
                         {"launch": "failed", "exited": False}, {"process_identity": None}]:
             record = dict(original, **changes)
@@ -310,6 +313,167 @@ class BgxTest(unittest.TestCase):
         self.cli("start", "web", "--", "/bin/true", expect=1)
         self.assertIn(b"unknown", self.cli("list", expect=1).stdout)
         self.cli("rm", "web", "--force")
+
+    def test_rename_keeps_running_process_metadata_and_open_log(self):
+        original = self.start()
+        before = (self.directory() / "meta.json").read_bytes()
+        self.assertNotIn("name", original)
+        self.assertEqual(original["schema_version"], 4)
+        follower = self.follow()
+        self.expect_output(follower, b"ready\n")
+        with self.log_path().open("ab", buffering=0) as writer:
+            inode = os.fstat(writer.fileno()).st_ino
+            self.cli("rename", "web", "Web")
+            self.assertFalse(self.directory().exists())
+            self.assertEqual((self.directory("Web") / "meta.json").read_bytes(), before)
+            self.assertEqual(self.log_path("Web").stat().st_ino, inode)
+            self.assertIn(b"Name:          Web", self.cli("info", "Web").stdout)
+            self.assertIn(b"running", self.cli("list").stdout)
+            writer.write(b"after rename\n")
+            self.expect_output(follower, b"after rename\n")
+        self.cli("stop", "web", expect=1)
+        os.kill(original["process_identity"]["pid"], 0)
+        self.cli("rename", "Web", "Web")  # An existing, readable same-name move is a no-op.
+        self.cli("stop", "Web")
+        self.cli("rename", "Web", "finished")
+        self.assertTrue(self.record("finished")["exited"])
+        self.assertTrue((self.state / "locks/web.lock").exists())
+        self.assertTrue((self.state / "locks/web.1.lock").exists())
+        self.stop_follow(follower)
+        self.cli("rm", "finished")
+
+    def test_rename_automatic_and_failed_runs(self):
+        name = self.cli("start", "--", "/bin/sleep", "120").stdout.decode().strip()
+        self.track(name)
+        self.cli("rename", name, "worker")
+        self.cli("stop", "worker")
+        self.cli("start", "broken", "--", str(self.base / "missing"), expect=1)
+        before = self.record("broken")
+        self.cli("rename", "broken", "failure")
+        self.assertEqual(self.record("failure"), before)
+        self.cli("prune")
+
+    def test_rename_never_overwrites_any_destination(self):
+        self.make_log(b"source\n")
+        self.start("target")
+        for kind in ["running", "exited", "broken", "empty", "symlink"]:
+            with self.subTest(kind=kind):
+                if kind == "exited":
+                    self.cli("stop", "target")
+                elif kind == "broken":
+                    (self.directory("target") / "meta.json").write_text("{broken")
+                elif kind == "empty":
+                    self.cli("rm", "target", "--force")
+                    self.directory("target").mkdir()
+                elif kind == "symlink":
+                    self.directory("target").rmdir()
+                    self.directory("target").symlink_to(self.cwd)
+                self.cli("rename", "web", "target", expect=1)
+                self.assertEqual(self.cli("log", "web").stdout, b"source\n")
+                self.assertTrue(self.directory("target").exists())
+
+    def test_rename_refuses_missing_invalid_stale_and_pending_sources(self):
+        self.cli("rename", "missing", "new", expect=1)
+        self.assertFalse(self.state.exists())
+        original = self.start()
+        for kind in ["stale", "pending", "invalid"]:
+            changed = deepcopy(original)
+            if kind == "stale":
+                changed["process_identity"]["start_marker"] += "-wrong"
+            elif kind == "pending":
+                changed["launch"] = "pending"
+            self.save(changed)
+            if kind == "invalid":
+                (self.directory() / "meta.json").write_text("{broken")
+            before = (self.directory() / "meta.json").read_bytes()
+            self.cli("rename", "web", "new", expect=1)
+            self.assertEqual((self.directory() / "meta.json").read_bytes(), before)
+            self.assertFalse(self.directory("new").exists())
+            os.kill(original["process_identity"]["pid"], 0)
+        self.save(original)
+        self.cli("stop", "web")
+
+
+
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_rename_crash_keeps_one_complete_directory(self):
+        for point, visible in [("before_rename", "web"), ("after_rename", "new")]:
+            self.start()
+            before = (self.directory() / "meta.json").read_bytes()
+            notice = self.base / point
+            env = dict(self.env, BGX_TEST_POINT=point, BGX_TEST_NOTIFY=str(notice))
+            child = subprocess.Popen([os.environ["BGX_FAULT_BIN"], "rename", "web", "new"],
+                                     env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            self.followers.append(child)
+            self.wait_test_point(child, notice)
+            child.kill()
+            child.communicate(timeout=5)
+            self.assertEqual(sorted(p.name for p in (self.state / "instances").iterdir()), [visible])
+            self.assertEqual((self.directory(visible) / "meta.json").read_bytes(), before)
+            self.cli("stop", visible)
+            self.cli("rm", visible)
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_rename_sync_error_reports_new_name(self):
+        self.start()
+        result = subprocess.run([os.environ["BGX_FAULT_BIN"], "rename", "web", "new"],
+                                env=dict(self.env, BGX_TEST_FAULT="rename_sync"), capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 1)
+        self.assertIn(b"use the new name", result.stderr)
+        self.assertFalse(self.directory().exists())
+        self.cli("stop", "new")
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_rename_holds_both_names_and_waiting_stop_reloads_old_name(self):
+        import fcntl
+        self.start("a")
+        notice = self.base / "rename-notice"
+        env = dict(self.env, BGX_TEST_POINT="before_rename", BGX_TEST_NOTIFY=str(notice))
+        move = subprocess.Popen([os.environ["BGX_FAULT_BIN"], "rename", "a", "b"], env=env,
+                                stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.followers.append(move)
+        self.wait_test_point(move, notice)
+        for name in ["a", "b"]:
+            with (self.state / "locks" / (name + ".lock")).open("rb") as lock:
+                with self.assertRaises(BlockingIOError):
+                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        stop = self.spawn(["stop", "a"])
+        opposite = self.spawn(["rename", "b", "a"])
+        with (self.state / "locks/a.lock").open("rb") as lock:
+            self.wait_for_name_lock(stop, lock)
+            self.wait_for_name_lock(opposite, lock)
+        os.kill(move.pid, signal.SIGCONT)
+        out, err = move.communicate(timeout=5)
+        self.assertEqual(move.returncode, 0, (out, err))
+        # Whichever waiter wins, both finish without deadlock or signalling a
+        # different run. The opposite rename returns the original run to a.
+        out, err = opposite.communicate(timeout=5)
+        self.assertEqual(opposite.returncode, 0, (out, err))
+        stop.communicate(timeout=5)
+        self.assertIn(stop.returncode, [0, 1])
+        self.cli("stop", "a")
+        self.assertFalse(self.directory("b").exists())
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_log_reader_pinned_before_rename_keeps_original_run(self):
+        self.make_log(b"original\n")
+        notice = self.base / "read-notice"
+        reader = subprocess.Popen([os.environ["BGX_FAULT_BIN"], "log", "web"],
+                                  env=dict(self.env, BGX_TEST_POINT="log_record_loaded",
+                                           BGX_TEST_NOTIFY=str(notice)),
+                                  stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.followers.append(reader)
+        self.wait_test_point(reader, notice)
+        self.cli("rename", "web", "other")
+        self.cli("start", "web", "--", "/bin/echo", "new")
+        self.track()
+        self.wait_exited()
+        os.kill(reader.pid, signal.SIGCONT)
+        out, err = reader.communicate(timeout=5)
+        self.assertEqual(reader.returncode, 0, err)
+        self.assertEqual(out, b"original\n")
+        self.assertEqual(self.cli("log", "web").stdout, b"new\n")
 
     def test_invalid_arguments(self):
         for args in [
@@ -350,7 +514,7 @@ class BgxTest(unittest.TestCase):
             (("rm", "web", "--force", "--force"), "duplicate option: --force", "remove"),
             (("prune", "--dry-run", "--dry-run"), "duplicate option: --dry-run", "prune"),
             (("stop",), "missing task name", "stop"),
-            (("stop", "web", "extra"), "unexpected argument: extra", "stop"),
+            (("info", "web", "extra"), "unexpected argument: extra", "info"),
             (("ls", "extra"), "unexpected argument: extra", "list"),
             (("version", "extra"), "unexpected argument: extra", "version"),
             (("start", "--"), "missing program after '--'", "start"),
@@ -568,7 +732,7 @@ class BgxTest(unittest.TestCase):
         self.assertIn(b"bgx start [NAME]", general)
         for args in [(), ("-h",), ("--help",)]:
             self.assertEqual(self.cli(*args).stdout, general)
-        commands = {"start": ["s"], "stop": [],
+        commands = {"start": ["s"], "stop": [], "rename": [],
                     "list": ["ls"], "info": [], "remove": ["rm"],
                     "prune": [], "log": [], "help": ["-h", "--help"], "version": ["-V", "--version"]}
         for command, aliases in commands.items():
@@ -1532,10 +1696,10 @@ class BgxTest(unittest.TestCase):
         base = json.dumps(original)
         variants = [
             base + "{}",
-            base.replace('"schema_version": 3', '"schema_version": 1'),
-            base.replace('"schema_version": 3', '"schema_version": 3, "schema_version": 3'),
-            base.replace('"name": "web"', '"name": "other"'),
-            base.replace('"name": "web"', '"name": "web\\u0000suffix"'),
+            base.replace('"schema_version": 4', '"schema_version": 3'),
+            base.replace('"schema_version": 4', '"schema_version": 4, "schema_version": 4'),
+            base[:-1] + ', "name": "web"}',
+            base.replace('"launch": "started"', '"launch": "started\\u0000suffix"'),
             base[:-1] + ', "surprise": true}',
         ]
         for text in variants:

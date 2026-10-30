@@ -42,6 +42,7 @@ Uninstall with `make uninstall PREFIX="$HOME/.local"` (use your installation pre
 | `bgx info NAME` | Show task details, launch diagnostics, and log paths |
 | `bgx log NAME [--tail N] [-f]` | Print all or the last N lines; `-f`/`--follow` streams new output |
 | `bgx stop NAME` | Stop a task, keeping its record and log |
+| `bgx rename OLD NEW` | Change a run's name without restarting it or replacing its log |
 | `bgx remove NAME` | Delete an exited task's record and log |
 | `bgx remove NAME --force` | Delete data only; **does not stop processes** |
 | `bgx prune [--dry-run]` | Delete all exited tasks, or preview the selection |
@@ -67,6 +68,18 @@ Every start uses the current directory and environment, disables terminal input,
 and combines stdout and stderr in one log. Success prints only the name to
 stdout. Errors go to stderr; launch errors include the name so retained records
 can be inspected. `s` is an alias for `start`.
+
+Use `rename` to give an automatically named run a memorable name, or change an
+explicit name. Running and exited runs can be renamed. The destination must be
+unused, even by an exited run; stale, unknown, or invalid source records are
+refused. The old name stops working immediately, while existing `log -f` viewers
+continue following the same file. Renaming a valid run to its current name is a no-op.
+
+```sh
+bgx rename python3-k7m2 worker
+bgx stop worker
+bgx remove worker
+```
 
 ### Shell commands
 
@@ -166,11 +179,12 @@ instances/<encoded-name>/
 locks/<encoded-name>.lock
 ```
 
-Names are encoded to stay distinct on case-insensitive filesystems. Records and
+Names are encoded to stay distinct on case-insensitive filesystems. The directory
+is the sole source of the name; `meta.json` does not duplicate it. Records and
 logs remain until removal or explicit name reuse; `prune --dry-run` previews
 cleanup of exited runs. Lock files remain to coordinate concurrent commands.
 
-**Schema 3 is incompatible with earlier formats.** Before upgrading, use the old
+**Schema 4 is incompatible with earlier formats.** Before upgrading, use the old
 version to stop tasks, verify their processes ended, delete the selected state
 directory, and recreate tasks. This discards old configurations and logs; there
 is no automatic migration or reset.

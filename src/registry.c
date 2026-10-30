@@ -307,11 +307,10 @@ static int reject_nul(const char *data, size_t length, Error *err) {
 
 /* Decode the only durable record for this run. */
 static int decode_record_fields(const cJSON *json, const char *name, Record *r, Error *err) {
-    const char *const keys[] = {"schema_version", "name", "argv", "cwd", "started_at", "exited",
+    const char *const keys[] = {"schema_version", "argv", "cwd", "started_at", "exited",
                                 "process_identity", "launch", "error", NULL};
     int rc = -1;
     const cJSON *schema = cJSON_GetObjectItemCaseSensitive(json, "schema_version");
-    const char *stored_name = string_field(json, "name");
     const char *cwd = string_field(json, "cwd");
     const char *started = string_field(json, "started_at");
     const char *launch = string_field(json, "launch");
@@ -319,7 +318,7 @@ static int decode_record_fields(const cJSON *json, const char *name, Record *r, 
     const cJSON *args = cJSON_GetObjectItemCaseSensitive(json, "argv");
     const cJSON *exited = cJSON_GetObjectItemCaseSensitive(json, "exited");
     if (!only_keys(json, keys) || !cJSON_IsNumber(schema) || schema->valuedouble != BGX_SCHEMA ||
-        !stored_name || strcmp(name, stored_name) || !cwd || cwd[0] != '/' ||
+        !cwd || cwd[0] != '/' ||
         !started || parse_time(started, &r->started) || !launch ||
         !cJSON_IsBool(exited) || !error || strlen(error) >= sizeof(r->error)) goto invalid;
     if (!strcmp(launch, "pending")) r->launch = PENDING;
@@ -390,7 +389,6 @@ static cJSON *encode_record(const Record *r) {
     cJSON *obj = cJSON_CreateObject();
     if (!obj) return NULL;
     if (!cJSON_AddNumberToObject(obj, "schema_version", BGX_SCHEMA) ||
-        !cJSON_AddStringToObject(obj, "name", r->name) ||
         !cJSON_AddStringToObject(obj, "cwd", r->cwd) ||
         !cJSON_AddStringToObject(obj, "started_at", started) ||
         !cJSON_AddBoolToObject(obj, "exited", r->exited) ||
@@ -539,6 +537,21 @@ int store_remove(Store *s, const char *name, Error *err) {
     if (name_key(name, key, err)) return -1;
     if (remove_entry(s->instances, key, 0, err)) return -1;
     if (fsync(s->instances)) return syserr(err, "sync registry directory");
+    return 0;
+}
+
+int store_rename(Store *s, const char *name, const char *new_name, Error *err) {
+    char source[NAME_KEY_SIZE], target[NAME_KEY_SIZE];
+    if (name_key(name, source, err) || name_key(new_name, target, err)) return -1;
+    int exists = store_exists(s, new_name, err);
+    if (exists < 0) return -1;
+    if (exists) return fail(err, "name already exists: %s", new_name);
+    bgx_test_point("before_rename");
+    if (renameat(s->instances, source, s->instances, target)) return syserr(err, "rename instance");
+    bgx_test_point("after_rename");
+    if (bgx_test_fault("rename_sync") || fsync(s->instances))
+        return fail(err, "renamed %s to %s, but syncing the state directory failed; use the new name",
+                    name, new_name);
     return 0;
 }
 
