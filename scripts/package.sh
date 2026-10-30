@@ -20,6 +20,7 @@ stage=$(mktemp -d)
 trap 'rm -rf "$stage"' EXIT
 cp README.md CHANGELOG.md "$stage/"
 cp vendor/cjson/LICENSE "$stage/cJSON-LICENSE"
+cp -R completions "$stage/"
 
 for arch in amd64 arm64; do
   case "$arch" in
@@ -38,6 +39,6 @@ for arch in amd64 arm64; do
     [[ $("$stage/bgx" --version) == "bgx $version" ]]
   fi
   archive="dist/bgx-${target_os}-${arch}.tar.gz"
-  tar -czf "$archive" -C "$stage" bgx README.md CHANGELOG.md cJSON-LICENSE
+  tar -czf "$archive" -C "$stage" bgx README.md CHANGELOG.md cJSON-LICENSE completions
   echo "$archive"
 done

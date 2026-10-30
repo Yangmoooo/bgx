@@ -7,6 +7,7 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Bash and zsh completion for commands, options, and run names.
 - `rename OLD NEW` changes a run's name while keeping its process and log.
 - `stop` and `remove` accept multiple names and continue after individual errors.
 

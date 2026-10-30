@@ -64,9 +64,13 @@ PREFIX ?= /usr/local
 install: build
 	install -d "$(DESTDIR)$(PREFIX)/bin"
 	install -m 755 $(BUILD)/bgx "$(DESTDIR)$(PREFIX)/bin/bgx"
+	install -d "$(DESTDIR)$(PREFIX)/share/bash-completion/completions" "$(DESTDIR)$(PREFIX)/share/zsh/site-functions"
+	install -m 644 completions/bgx.bash "$(DESTDIR)$(PREFIX)/share/bash-completion/completions/bgx"
+	install -m 644 completions/_bgx "$(DESTDIR)$(PREFIX)/share/zsh/site-functions/_bgx"
 
 uninstall:
 	rm -f -- "$(DESTDIR)$(PREFIX)/bin/bgx"
+	rm -f -- "$(DESTDIR)$(PREFIX)/share/bash-completion/completions/bgx" "$(DESTDIR)$(PREFIX)/share/zsh/site-functions/_bgx"
 
 clean:
 	rm -rf -- build dist

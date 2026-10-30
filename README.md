@@ -22,16 +22,85 @@ bgx stop "$name"
 
 ## Installation
 
-Requires Make and the Zig version in [.zig-version](.zig-version), plus Command
-Line Tools on macOS.
+Download an archive from [Releases](https://github.com/Yangmoooo/bgx/releases)
+for your system: `darwin` for macOS or `linux`, and `arm64` for Apple Silicon /
+AArch64 or `amd64` for Intel / x86-64. Extract it and open a terminal in the
+extracted directory. Install the binary without cloning the repository or
+installing build tools:
+
+```sh
+mkdir -p "$HOME/.local/bin"
+install -m 755 bgx "$HOME/.local/bin/bgx"
+```
+
+Add `export PATH="$HOME/.local/bin:$PATH"` to your shell startup file if that
+directory is not already on `PATH`.
+
+### Shell completion
+
+The archive includes both completion files. Install the one for your shell from
+the extracted directory; no `make` command is needed.
+
+**Bash 3.2 or later**
+
+```sh
+mkdir -p "$HOME/.local/share/bash-completion/completions"
+install -m 644 completions/bgx.bash "$HOME/.local/share/bash-completion/completions/bgx"
+```
+
+Add this to `~/.bashrc`, and run the same line to enable completion immediately:
+
+```sh
+source "$HOME/.local/share/bash-completion/completions/bgx"
+```
+
+For a bash login shell, ensure `~/.bash_profile` sources `~/.bashrc`.
+
+**Zsh**
+
+```sh
+mkdir -p "$HOME/.local/share/zsh/site-functions"
+install -m 644 completions/_bgx "$HOME/.local/share/zsh/site-functions/_bgx"
+```
+
+Add this to `~/.zshrc`, **before** your existing `compinit` or shell framework
+initialization:
+
+```zsh
+fpath=("$HOME/.local/share/zsh/site-functions" $fpath)
+```
+
+If you do not already initialize completion, add these lines after it:
+
+```zsh
+autoload -Uz compinit
+compinit
+```
+
+Open a new zsh terminal to activate completion.
+
+Tab completes commands, options, and current run names, including exited runs.
+`stop` and `remove` omit names already entered; `rename` completes only the old
+name. Names are refreshed from the selected state directory on each completion.
+Completion stops after `--`; the launched program's arguments are not completed.
+
+### Build from source
+
+In a repository checkout, building requires Make and the Zig version in
+[.zig-version](.zig-version), plus Command Line Tools on macOS:
 
 ```sh
 make
 make install PREFIX="$HOME/.local"
 ```
 
-Add `~/.local/bin` to `PATH`, or run `./build/bgx` directly.
-Uninstall with `make uninstall PREFIX="$HOME/.local"` (use your installation prefix).
+This installs the binary and both completion files at the paths above. Follow
+the shell configuration steps to enable completion.
+
+To uninstall a manual installation, delete the installed binary and completion
+files and remove the corresponding shell configuration. From a checkout, you
+can instead use `make uninstall PREFIX="$HOME/.local"` to delete the installed
+files. Neither method stops runs or removes their state directory.
 
 ## Usage
 
@@ -197,7 +266,8 @@ is no automatic migration or reset.
 ## Development
 
 C17, built with Zig; Linux binaries statically link musl. Tests require Python 3;
-ASan/UBSan checks also require Clang.
+ASan/UBSan checks also require Clang. Completion tests use bash and zsh; an absent
+shell is skipped locally, and CI checks both.
 
 ```sh
 make            # Release binary: build/bgx

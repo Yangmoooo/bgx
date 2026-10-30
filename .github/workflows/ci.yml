@@ -41,9 +41,14 @@ jobs:
       - uses: mlugg/setup-zig@v2
         with:
           version: ${{ steps.zig.outputs.version }}
+      - name: Install completion test shell
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y zsh
       - name: Validate scripts and release notes
         run: |
           bash -n scripts/zig-cc.sh scripts/release-notes.sh scripts/package.sh
+          bash -n completions/bgx.bash
+          zsh -n completions/_bgx
           if [[ $RELEASE_TAG != dev ]]; then
             bash scripts/release-notes.sh "$RELEASE_TAG" > /dev/null
           fi
@@ -58,7 +63,7 @@ jobs:
           for arch in amd64 arm64; do
             mkdir "$verify_dir/$arch"
             tar -xzf "dist/bgx-$PLATFORM-$arch.tar.gz" -C "$verify_dir/$arch"
-            for file in bgx README.md CHANGELOG.md cJSON-LICENSE; do
+            for file in bgx README.md CHANGELOG.md cJSON-LICENSE completions/bgx.bash completions/_bgx; do
               test -s "$verify_dir/$arch/$file"
             done
             test -x "$verify_dir/$arch/bgx"
