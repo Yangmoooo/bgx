@@ -36,7 +36,7 @@ static const struct {
      "Check the directory before stopping. A stop failure prevents a new launch.\n"
      "Replace the old log when starting the new run; a launch failure does not restore it.\n"
      "Print the name on success. Stale, unknown, and invalid records are refused.\n", {NULL}},
-    [CMD_STOP] = {"stop", "stop NAME [NAME...] | stop --all", "Stop background commands and their process groups.",
+    [CMD_STOP] = {"stop", "stop {NAME [NAME...] | --all}", "Stop background commands and their process groups.",
      "Send TERM, wait up to 5 seconds, then KILL if needed. Keep records and logs.\n"
      "--all selects all recorded names in the current state directory; do not combine it with names.\n"
      "Already-exited runs are harmless; stale, unknown, or unreadable records report errors.\n"
@@ -113,6 +113,13 @@ static void command_help(FILE *out, const char *cmd) {
 }
 
 static bool is_help(const char *arg) { return !strcmp(arg, "--help") || !strcmp(arg, "-h"); }
+
+/* Operation errors carry a reason; the reporting boundary adds task context. */
+static void report_error(const char *name, const Error *err) {
+    fputs("bgx: ", stderr);
+    if (name) fprintf(stderr, "%s: ", name);
+    fprintf(stderr, "%s\n", err->text[0] ? err->text : "operation failed");
+}
 
 typedef struct {
     Command command;
@@ -226,8 +233,8 @@ static Status task_status(const Record *record, Error *err) {
 }
 
 static int unsafe_status(const char *name, Status state, Error *err) {
-    return fail(err, "%s has %s identity; inspect it or use bgx remove %s --force to delete data without stopping processes",
-                name, status_name(state), name);
+    return fail(err, "has %s identity; inspect it or use bgx remove %s --force to delete data without stopping processes",
+                status_name(state), name);
 }
 
 typedef struct {
@@ -318,7 +325,7 @@ done:
 static int start_locked(Store *s, const char *name, Record *record, int argc, char **argv, Error *err) {
     if (record->name) {
         Status state = task_status(record, err);
-        if (state == RUNNING) return fail(err, "%s is running; stop it before reusing its name", name);
+        if (state == RUNNING) return fail(err, "is running; stop it before reusing its name");
         if (state != EXITED) return unsafe_status(name, state, err);
     }
     char *cwd = getcwd(NULL, 0);
@@ -343,7 +350,7 @@ static int stop_locked(Store *s, const char *name, Record *record, Error *err) {
 
 static int remove_locked(Store *s, const char *name, Record *record, Error *err) {
     Status state = task_status(record, err);
-    if (state == RUNNING) return fail(err, "%s is running; stop it before removing", name);
+    if (state == RUNNING) return fail(err, "is running; stop it before removing");
     if (state != EXITED) return unsafe_status(name, state, err);
     return store_remove(s, name, err);
 }
@@ -438,7 +445,7 @@ static int log_instance(const char *name, const uintmax_t *tail, bool follow, Er
     Store s;
     int opened = store_open(&s, false, err);
     if (opened < 0) return -1;
-    if (opened == 1) return fail(err, "instance not found: %s", name);
+    if (opened == 1) return fail(err, "instance not found");
     int fd = store_log(&s, name, err);
     store_close(&s);
     if (fd < 0) return -1;
@@ -501,16 +508,13 @@ static int info_instance(const char *name, Error *err) {
     Store s;
     int opened = store_open(&s, false, err);
     if (opened < 0) return -1;
-    if (opened == 1) return fail(err, "instance not found: %s", name);
+    if (opened == 1) return fail(err, "instance not found");
     Record record;
     int loaded = store_load(&s, name, &record, err);
     char *path = loaded == 0 ? store_log_path(&s, name, err) : NULL;
     int rc = -1;
-    if (loaded == 1) fail(err, "instance not found: %s", name);
-    else if (loaded < 0) {
-        Error cause = *err;
-        fail(err, "%s: %.360s", name, cause.text);
-    } else if (path) rc = print_info(&record, path, err);
+    if (loaded == 1) fail(err, "instance not found");
+    else if (!loaded && path) rc = print_info(&record, path, err);
     record_free(&record);
     free(path);
     store_close(&s);
@@ -520,13 +524,13 @@ static int info_instance(const char *name, Error *err) {
 static int mutate_instance(Command command, const char *name, bool force,
                            int program_argc, char **program_argv, Error *err) {
     Store s;
+    int rc = -1, lock = -1;
     int opened = store_open(&s, command != CMD_RESTART, err);
-    if (opened < 0) return -1;
-    if (opened == 1) return fail(err, "instance not found: %s", name);
-    if (store_open_locks(&s, err)) { store_close(&s); return -1; }
+    if (opened < 0) goto done;
+    if (opened == 1) { fail(err, "instance not found"); goto done; }
+    if (store_open_locks(&s, err)) goto done;
     bool automatic = command == CMD_START && !name;
     char generated[30];
-    int rc = -1, lock = -1;
     for (unsigned tries = 0; tries < 100; ++tries) {
         if (automatic) {
             if (generate_name(program_argv[0], generated, err)) goto done;
@@ -552,7 +556,7 @@ static int mutate_instance(Command command, const char *name, bool force,
         int loaded = store_load(&s, name, &record, err);
         if (loaded < 0) rc = -1;
         else if (command == CMD_START) rc = start_locked(&s, name, &record, program_argc, program_argv, err);
-        else if (loaded == 1) fail(err, "instance not found: %s", name);
+        else if (loaded == 1) fail(err, "instance not found");
         else if (command == CMD_RESTART) rc = restart_locked(&s, name, &record, err);
         else if (command == CMD_STOP) rc = stop_locked(&s, name, &record, err);
         else if (command == CMD_REMOVE) rc = remove_locked(&s, name, &record, err);
@@ -567,10 +571,7 @@ static int mutate_instance(Command command, const char *name, bool force,
         }
     }
 done:
-    if (rc && (command == CMD_START || command == CMD_RESTART) && name) {
-        Error cause = *err;
-        fail(err, "%s: %.370s", name, cause.text);
-    }
+    if (rc) report_error(name, err);
     if (lock >= 0) close(lock);
     store_close(&s);
     return rc;
@@ -585,7 +586,6 @@ static int mutate_names(const Arguments *args) {
         if (!strcmp(name, "--force")) continue;
         Error detail = {0};
         if (mutate_instance(args->command, name, args->force, 0, NULL, &detail)) {
-            fprintf(stderr, "bgx: %s: %s\n", name, detail.text);
             failed = true;
         }
     }
@@ -618,7 +618,7 @@ static int stop_all(Error *err) {
             close(lock);
         }
         if (stopped) {
-            fprintf(stderr, "bgx: %s: %s\n", names[i], detail.text);
+            report_error(names[i], &detail);
             failed = true;
         }
     }
@@ -633,7 +633,7 @@ static int rename_instance(const char *name, const char *new_name, Error *err) {
     Store s;
     int opened = store_open(&s, false, err);
     if (opened < 0) return -1;
-    if (opened == 1) return fail(err, "instance not found: %s", name);
+    if (opened == 1) return fail(err, "instance not found");
     int first = -1, second = -1, rc = -1;
     Record record = {0};
     if (store_open_locks(&s, err)) goto done;
@@ -647,7 +647,7 @@ static int rename_instance(const char *name, const char *new_name, Error *err) {
     }
     int loaded = store_load(&s, name, &record, err);
     if (loaded < 0) goto done;
-    if (loaded == 1) { fail(err, "instance not found: %s", name); goto done; }
+    if (loaded == 1) { fail(err, "instance not found"); goto done; }
     Status state = task_status(&record, err);
     if (state != RUNNING && state != EXITED) { unsafe_status(name, state, err); goto done; }
     rc = !strcmp(name, new_name) ? 0 : store_rename(&s, name, new_name, err);
@@ -659,34 +659,30 @@ done:
     return rc;
 }
 
-/* Per-task prune problems are named and make the batch exit nonzero without
-   stopping later candidates. */
-static void prune_name_error(const char *name, const char *message) {
-    fprintf(stderr, "bgx: %s: %s\n", name, message);
-}
-
 /* Delete one candidate under its name lock. The record is reloaded and reassessed
-   while locked so a task that started while waiting is never removed. */
+   while locked so a task that started while waiting is never removed. Errors
+   are named and do not prevent later candidates from being processed. */
 static void prune_candidate(Store *s, const char *name, size_t *removed, bool *failed) {
     Error detail = {0};
     int lock = store_lock(s, name, &detail);
-    if (lock < 0) { prune_name_error(name, detail.text); *failed = true; return; }
+    if (lock < 0) { report_error(name, &detail); *failed = true; return; }
     Record task;
     int loaded = store_load(s, name, &task, &detail);
     if (loaded == 1) {
         /* Concurrent preparation/removal: the record is already gone. */
     } else if (loaded < 0) {
-        prune_name_error(name, detail.text);
+        report_error(name, &detail);
         *failed = true;
     } else {
         Status state = task_status(&task, &detail);
         if (state == RUNNING) {
             /* The name was reused for a running task while waiting. */
         } else if (state != EXITED) {
-            prune_name_error(name, detail.text[0] ? detail.text : status_name(state));
+            if (!detail.text[0]) fail(&detail, "%s", status_name(state));
+            report_error(name, &detail);
             *failed = true;
         } else if (store_remove(s, name, &detail)) {
-            prune_name_error(name, detail.text);
+            report_error(name, &detail);
             *failed = true;
         } else {
             printf("Removed %s\n", name);
@@ -713,7 +709,7 @@ static int prune_instances(bool dry_run, Error *err) {
         int loaded = store_load(&s, names[i], &task, &detail);
         if (loaded == 1) continue; /* Concurrent preparation/removal. */
         if (loaded < 0) {
-            prune_name_error(names[i], detail.text);
+            report_error(names[i], &detail);
             failed = true;
             continue;
         }
@@ -721,7 +717,8 @@ static int prune_instances(bool dry_run, Error *err) {
         record_free(&task);
         if (state == RUNNING) continue; /* Running tasks are silent, normal skips. */
         if (state != EXITED) {
-            prune_name_error(names[i], detail.text[0] ? detail.text : status_name(state));
+            if (!detail.text[0]) fail(&detail, "%s", status_name(state));
+            report_error(names[i], &detail);
             failed = true;
             continue;
         }
@@ -765,7 +762,7 @@ static int list_instances(Error *err) {
         if (loaded == 1) continue; /* Concurrent preparation/removal. */
         if (loaded < 0) {
             printf("%-24s %-9s %-8s %-9s %s\n", names[i], status_name(UNKNOWN), "-", "-", "-");
-            fprintf(stderr, "bgx: %s: %s\n", names[i], load_error.text);
+            report_error(names[i], &load_error);
             incomplete = true;
             continue;
         }
@@ -837,11 +834,10 @@ int main(int argc, char **argv) {
     case CMD_REMOVE: return mutate_names(&args);
     case CMD_RENAME: rc = rename_instance(args.name, args.new_name, &err); break;
     case CMD_START: case CMD_RESTART:
-        rc = mutate_instance(args.command, args.name, args.force,
-                             args.program_argc, args.program_argv, &err);
-        break;
+        return mutate_instance(args.command, args.name, args.force,
+                               args.program_argc, args.program_argv, &err) ? 1 : 0;
     default: return 2; /* Help and invalid commands are handled before execution. */
     }
-    if (rc) fprintf(stderr, "bgx: %s\n", err.text[0] ? err.text : "operation failed");
+    if (rc) report_error(args.name, &err);
     return rc ? 1 : 0;
 }

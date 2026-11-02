@@ -796,6 +796,34 @@ class BgxTest(unittest.TestCase):
         self.assertEqual(out, b"original\n")
         self.assertEqual(self.cli("log", "web").stdout, b"new\n")
 
+    def test_task_error_context_is_not_repeated(self):
+        original = self.start()
+        result = self.cli("rm", "web", expect=1)
+        self.assertEqual(result.stderr, b"bgx: web: is running; stop it before removing\n")
+        result = self.cli("start", "web", "--", TRUE, expect=1)
+        self.assertEqual(result.stderr, b"bgx: web: is running; stop it before reusing its name\n")
+        for command in ["stop", "rm", "restart", "info", "log"]:
+            result = self.cli(command, "missing", expect=1)
+            self.assertEqual(result.stderr, b"bgx: missing: instance not found\n")
+        self.assertEqual(self.cli("rename", "missing", "new", expect=1).stderr,
+                         b"bgx: missing: instance not found\n")
+        stale = deepcopy(original)
+        stale["process_identity"]["start_marker"] += "-wrong"
+        self.save(stale)
+        for args in [("stop", "web"), ("stop", "--all"), ("rm", "web"),
+                     ("restart", "web"), ("rename", "web", "new")]:
+            result = self.cli(*args, expect=1)
+            self.assertTrue(result.stderr.startswith(b"bgx: web: has stale identity;"), result.stderr)
+            self.assertIn(b"bgx remove web --force", result.stderr)
+        self.save(original)
+        self.cli("stop", "web")
+        invalid = dict(self.record(), schema_version=999)
+        self.save(invalid)
+        for args in [("info", "web"), ("log", "web"), ("start", "web", "--", TRUE),
+                     ("rm", "web"), ("list",), ("prune",)]:
+            result = self.cli(*args, expect=1)
+            self.assertIn(b"bgx: web: invalid, unsupported or incomplete record\n", result.stderr)
+
     def test_invalid_arguments(self):
         for args in [
             ("web", "--", "true"), ("run", "web", "--", "true"),
@@ -964,7 +992,7 @@ class BgxTest(unittest.TestCase):
     def test_info_missing_and_invalid_records_report_named_errors(self):
         result = self.cli("info", "missing", expect=1)
         self.assertEqual(result.stdout, b"")
-        self.assertIn(b"instance not found: missing", result.stderr)
+        self.assertIn(b"bgx: missing: instance not found", result.stderr)
         self.assertFalse(self.state.exists())
         self.make_log()
         meta = self.directory() / "meta.json"
@@ -1301,11 +1329,11 @@ class BgxTest(unittest.TestCase):
 
     def test_log_missing_instance_does_not_create_state_or_locks(self):
         result = self.cli("log", "missing", expect=1)
-        self.assertIn(b"instance not found: missing", result.stderr)
+        self.assertIn(b"bgx: missing: instance not found", result.stderr)
         self.assertFalse(self.state.exists())
         (self.state / "instances").mkdir(parents=True)
         result = self.cli("log", "missing", expect=1)
-        self.assertIn(b"instance not found: missing", result.stderr)
+        self.assertIn(b"bgx: missing: instance not found", result.stderr)
         self.assertFalse((self.state / "locks").exists())
         self.assertEqual(list((self.state / "instances").iterdir()), [])
 
@@ -1566,7 +1594,7 @@ class BgxTest(unittest.TestCase):
     def test_log_follow_startup_errors_are_immediate_and_readonly(self):
         result = self.cli("log", "missing", "--follow", expect=1)
         self.assertEqual(result.stdout, b"")
-        self.assertIn(b"instance not found: missing", result.stderr)
+        self.assertIn(b"bgx: missing: instance not found", result.stderr)
         self.assertFalse(self.state.exists())
         path = self.make_log(b"data\n")
         meta = self.directory() / "meta.json"

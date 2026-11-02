@@ -11,6 +11,10 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   current environment, keeping its name and replacing its log. No failure rollback.
 - `stop --all` stops recorded runs while keeping their records and logs.
 
+### Fixed
+
+- Clarify `stop` usage in help and avoid repeated run names in error messages.
+
 ## [0.4.0] - 2026-10-30
 
 ### Added

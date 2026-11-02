@@ -343,7 +343,7 @@ static int decode_record_fields(const cJSON *json, const char *name, Record *r, 
     rc = 0;
     goto done;
 invalid:
-    fail(err, "invalid, unsupported or incomplete record for %s", name);
+    fail(err, "invalid, unsupported or incomplete record");
     goto done;
 oom:
     fail(err, "out of memory");
@@ -478,7 +478,7 @@ int store_load(Store *s, const char *name, Record *record, Error *err) {
     int rc = load_record(dir, name, record, err);
     close(dir);
     /* An incomplete directory is occupied, not permission to overwrite evidence. */
-    if (rc == 1) return fail(err, "incomplete record for %s; inspect or remove it with --force", name);
+    if (rc == 1) return fail(err, "incomplete record; inspect or remove it with --force");
     return rc;
 }
 
@@ -550,14 +550,13 @@ int store_rename(Store *s, const char *name, const char *new_name, Error *err) {
     if (renameat(s->instances, source, s->instances, target)) return syserr(err, "rename instance");
     bgx_test_point("after_rename");
     if (bgx_test_fault("rename_sync") || fsync(s->instances))
-        return fail(err, "renamed %s to %s, but syncing the state directory failed; use the new name",
-                    name, new_name);
+        return fail(err, "renamed to %s, but syncing the state directory failed; use the new name", new_name);
     return 0;
 }
 
 int store_log(Store *s, const char *name, Error *err) {
     int dir = open_instance(s, name, false, err);
-    if (dir < 0) return errno == ENOENT ? fail(err, "instance not found: %s", name) : -1;
+    if (dir < 0) return errno == ENOENT ? fail(err, "instance not found") : -1;
     /* Pin the instance directory: name reuse removes and recreates it, so a
        reader can never jump from an old record to a new run's log. */
     Record record = {0};
@@ -566,7 +565,7 @@ int store_log(Store *s, const char *name, Error *err) {
     if (!loaded) {
         bgx_test_point("log_record_loaded");
         fd = regular_file(dir, BGX_LOG_FILE, O_RDONLY, err);
-    } else if (loaded == 1) fail(err, "incomplete record for %s", name);
+    } else if (loaded == 1) fail(err, "incomplete record");
     record_free(&record);
     close(dir);
     return fd;
