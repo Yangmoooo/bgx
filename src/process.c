@@ -405,13 +405,24 @@ Status process_inspect(const Identity *id, Error *err) {
             return STALE;
         }
     }
-    if (kill(-id->pgid, 0) < 0) {
+    int probe = kill(-id->pgid, 0);
+    if (bgx_test_fault("group_probe_denied")) { probe = -1; errno = EPERM; }
+    bool denied = false;
+#ifdef __APPLE__
+    denied = probe < 0 && errno == EPERM;
+#endif
+    if (probe < 0 && !denied) {
         if (errno == ESRCH) return EXITED;
         syserr(err, "inspect process group"); return UNKNOWN;
     }
     bool live;
     if (platform_group_live(id->pgid, &live, err)) return UNKNOWN;
-    return live ? RUNNING : EXITED;
+    /* Darwin can deny signal-zero probes on exiting/zombie-only groups.
+       Successful enumeration with no live members proves completion. A denied
+       probe on a live group is still unknown and must never authorize signals. */
+    if (!live) return EXITED;
+    if (denied) { errno = EPERM; syserr(err, "inspect process group"); return UNKNOWN; }
+    return RUNNING;
 }
 
 static int wait_exit(const Identity *id, int milliseconds, Error *err) {

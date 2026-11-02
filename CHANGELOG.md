@@ -14,6 +14,7 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Avoid reporting exited process groups as unknown during macOS exit races.
 - Clarify `stop` usage in help and avoid repeated run names in error messages.
 
 ## [0.4.0] - 2026-10-30

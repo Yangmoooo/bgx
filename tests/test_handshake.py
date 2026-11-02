@@ -297,6 +297,43 @@ class HandshakeTest(unittest.TestCase):
         self.cli("stop", "web")
         self.assertTrue(self.record()["exited"])
 
+    @unittest.skipUnless(sys.platform == "darwin", "macOS exiting-group probe behavior")
+    def test_permission_probe_on_empty_group_does_not_block_stop(self):
+        self.cli("start", "web", "--", TRUE)
+        # First establish that the group is empty, then reproduce Darwin's
+        # observed EPERM response at the signal-zero probe deterministically.
+        deadline = time.monotonic() + 3
+        while b"exited" not in self.cli("list").stdout:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        env = dict(self.env, BGX_TEST_FAULT="group_probe_denied")
+        self.assertIn(b"exited", self.cli("info", "web", env=env).stdout)
+        self.cli("stop", "web", env=env)
+        self.assertTrue(self.record()["exited"])
+
+    def test_permission_probe_on_live_group_still_refuses_signals(self):
+        self.cli("start", "web", "--", "/bin/sleep", "120")
+        original = self.record()
+        pid = original["process_identity"]["pid"]
+        self.pids.add(pid)
+        env = dict(self.env, BGX_TEST_FAULT="group_probe_denied")
+        self.assertIn(b"unknown", self.cli("info", "web", env=env).stdout)
+        self.cli("stop", "web", env=env, expect=1)
+        self.assertEqual(self.record(), original)
+        os.kill(pid, 0)
+
+    @unittest.skipUnless(sys.platform == "darwin", "macOS libproc error convention")
+    def test_permission_probe_with_failed_group_query_stays_unknown(self):
+        self.cli("start", "web", "--", TRUE)
+        deadline = time.monotonic() + 3
+        while b"exited" not in self.cli("list").stdout:
+            self.assertLess(time.monotonic(), deadline)
+            time.sleep(0.01)
+        env = dict(self.env, BGX_TEST_FAULT="group_probe_denied,listpids_error")
+        self.assertIn(b"unknown", self.cli("info", "web", env=env).stdout)
+        self.cli("stop", "web", env=env, expect=1)
+        self.assertFalse(self.record()["exited"])
+
     def test_production_binary_ignores_fault_configuration(self):
         binary = os.environ.get("BGX_BIN")
         if not binary:
