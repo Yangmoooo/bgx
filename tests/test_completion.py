@@ -72,10 +72,10 @@ class CompletionTest(unittest.TestCase):
             self.cli("stop", name)
 
     def test_commands_options_and_separator(self):
-        commands = {"start", "s", "stop", "rename", "list", "ls", "info", "log",
+        commands = {"start", "s", "restart", "stop", "rename", "list", "ls", "info", "log",
                     "remove", "rm", "prune", "help", "version", "-h", "--help", "-V", "--version"}
         cases = [(("",), commands), (("help", ""), commands),
-                 (("--help", "re"), {"rename", "remove"}),
+                 (("--help", "re"), {"rename", "remove", "restart"}),
                  (("help", "stop", ""), set()),
                  (("s", ""), {"--", "-h", "--help"}),
                  (("start", "web", ""), {"--", "-h", "--help"}),
@@ -90,6 +90,7 @@ class CompletionTest(unittest.TestCase):
                  (("stop", "web", "-"), {"-h", "--help"}),
                  (("stop", "--all", ""), {"-h", "--help"}),
                  (("stop", "--all", "--a"), set()),
+                 (("restart", "-"), {"-h", "--help"}),
                  (("prune", "--dry-run", "-"), {"-h", "--help"}),
                  (("list", "-"), {"-h", "--help"}),
                  (("ps", ""), set()), (("logs", ""), set())]
@@ -102,6 +103,8 @@ class CompletionTest(unittest.TestCase):
     def test_names_multiple_operands_and_rename_destination(self):
         self.make_runs()
         cases = [(("stop", "w"), {"web", "worker"}),
+                 (("restart", "w"), {"web", "worker"}),
+                 (("restart", "web", "w"), set()),
                  (("info", "W"), {"Web"}),
                  (("rename", "w"), {"web", "worker"}),
                  (("rename", "web", "w"), set()),

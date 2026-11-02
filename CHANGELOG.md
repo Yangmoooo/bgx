@@ -7,6 +7,8 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- `restart NAME` reruns the recorded command in its recorded directory with the
+  current environment, keeping its name and replacing its log. No failure rollback.
 - `stop --all` stops recorded runs while keeping their records and logs.
 
 ## [0.4.0] - 2026-10-30

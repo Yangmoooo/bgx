@@ -393,6 +393,165 @@ class BgxTest(unittest.TestCase):
         self.save(original)
         self.cli("stop", "web")
 
+    def test_restart_reuses_name_argv_cwd_and_current_environment(self):
+        code = ("import json,os,sys,time; "
+                "print(json.dumps([os.getpid(),os.getcwd(),os.environ.get('BGX_TEST_VALUE'),sys.argv[1:]]),flush=True); "
+                "time.sleep(120)")
+        argv = [sys.executable, "-c", code, "two words", "", "--help"]
+        name = self.cli("start", "--", *argv).stdout.decode().strip()
+        original = self.track(name)
+        self.wait_log(b"inherited value", name)
+        with self.log_path(name).open("rb") as old_log:
+            result = self.cli("restart", name, cwd=self.base,
+                              env=dict(self.env, BGX_TEST_VALUE="new environment"))
+            self.assertEqual(result.stdout, (name + "\n").encode())
+            current = self.track(name)
+            output = json.loads(self.wait_log(b"new environment", name).splitlines()[0])
+            self.assertEqual(output[1:], [str(self.cwd), "new environment", ["two words", "", "--help"]])
+            self.assertNotEqual(output[0], original["process_identity"]["pid"])
+            self.assertEqual(current["argv"], argv)
+            self.assertEqual(current["cwd"], str(self.cwd))
+            self.assertNotEqual(os.fstat(old_log.fileno()).st_ino, self.log_path(name).stat().st_ino)
+            self.assertIn(b"inherited value", old_log.read())
+        with self.assertRaises(ProcessLookupError):
+            os.kill(original["process_identity"]["pid"], 0)
+        self.cli("stop", name)
+
+    def test_restart_missing_name_does_not_create_state(self):
+        result = self.cli("restart", "missing", expect=1)
+        self.assertIn(b"instance not found", result.stderr)
+        self.assertFalse(self.state.exists())
+
+    def test_restart_directory_failure_leaves_running_process_and_log(self):
+        original = self.start()
+        before = (self.directory() / "meta.json").read_bytes()
+        log = self.log_path().read_bytes()
+        self.cwd.rename(self.base / "moved-project")
+        result = self.cli("restart", "web", cwd=self.base, expect=1)
+        self.assertIn(b"recorded working directory", result.stderr)
+        self.assertEqual((self.directory() / "meta.json").read_bytes(), before)
+        self.assertEqual(self.log_path().read_bytes(), log)
+        os.kill(original["process_identity"]["pid"], 0)
+        self.cli("stop", "web", cwd=self.base)
+
+    def test_restart_after_exit_failure_and_rename_uses_current_path(self):
+        script = self.cwd / "worker"
+        script.write_text("#!/bin/sh\nprintf 'old\\n'\n")
+        script.chmod(0o700)
+        self.cli("start", "web", "--", "worker", env=dict(self.env, PATH=str(self.cwd)))
+        self.track()
+        self.wait_exited()
+        self.cli("rename", "web", "Web")
+        result = self.cli("restart", "Web", env=dict(self.env, PATH=str(self.base)), expect=1)
+        self.assertIn(b"execute worker", result.stderr)
+        self.assertEqual(self.record("Web")["launch"], "failed")
+        self.assertEqual(self.cli("log", "Web").stdout, b"")
+        self.assertIn(b"execute worker", self.cli("info", "Web").stdout)
+        new_script = self.base / "worker"
+        new_script.write_text("#!/bin/sh\nprintf 'new\\n'\n")
+        new_script.chmod(0o700)
+        self.cli("restart", "Web", env=dict(self.env, PATH=str(self.base)))
+        self.track("Web")
+        self.wait_exited("Web")
+        self.assertEqual(self.cli("log", "Web").stdout, b"new\n")
+        self.cli("rm", "Web")
+
+    def test_restart_relative_program_and_state_root_and_explicit_env(self):
+        script = self.cwd / "worker"
+        script.write_text("#!/bin/sh\nprintf '%s\\n' \"$BGX_TEST_VALUE\"\n")
+        script.chmod(0o700)
+        self.cli("start", "web", "--", "env", "BGX_TEST_VALUE=fixed", "./worker")
+        self.track()
+        self.wait_exited()
+        self.cli("restart", "web", cwd=self.base,
+                 env=dict(self.env, BGX_STATE_HOME="state", BGX_TEST_VALUE="changed"))
+        self.track()
+        self.wait_exited()
+        self.assertEqual(self.cli("log", "web").stdout, b"fixed\n")
+        self.assertFalse((self.cwd / "state").exists())
+
+    def test_restart_rejects_unsafe_records_and_extra_arguments(self):
+        original = self.start()
+        for args in [("restart",), ("restart", "web", "other"), ("restart", "web", "--all"),
+                     ("restart", "--all"), ("restart", "web", "--", TRUE)]:
+            self.cli(*args, expect=2)
+        self.cli("restart", "web", "--help")
+        self.assertEqual(self.record(), original)
+        for kind in ["stale", "pending", "invalid"]:
+            value = deepcopy(original)
+            if kind == "stale":
+                value["process_identity"]["start_marker"] += "-wrong"
+            elif kind == "pending":
+                value["launch"] = "pending"
+            self.save(value)
+            if kind == "invalid":
+                (self.directory() / "meta.json").write_text("{broken")
+            before = (self.directory() / "meta.json").read_bytes()
+            self.cli("restart", "web", expect=1)
+            self.assertEqual((self.directory() / "meta.json").read_bytes(), before)
+            os.kill(original["process_identity"]["pid"], 0)
+        self.save(original)
+        self.cli("stop", "web")
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_restart_stop_failure_keeps_old_process_and_log(self):
+        original = self.start()
+        before = self.log_path().read_bytes()
+        result = subprocess.run([os.environ["BGX_FAULT_BIN"], "restart", "web"],
+                                env=dict(self.env, BGX_TEST_FAULT="stop_failure"),
+                                capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 1, result.stderr)
+        self.assertIn(b"injected stop failure", result.stderr)
+        self.assertEqual(self.record(), original)
+        self.assertEqual(self.log_path().read_bytes(), before)
+        os.kill(original["process_identity"]["pid"], 0)
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_restart_interrupted_after_stop_can_retry_without_recovery_state(self):
+        import fcntl
+        original = self.start()
+        before = self.log_path().read_bytes()
+        notice = self.base / "restart-notice"
+        child = subprocess.Popen([os.environ["BGX_FAULT_BIN"], "restart", "web"],
+                                 env=dict(self.env, BGX_TEST_POINT="restart_stopped", BGX_TEST_NOTIFY=str(notice)),
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.followers.append(child)
+        self.wait_test_point(child, notice)
+        with (self.state / "locks/web.lock").open("rb") as lock:
+            with self.assertRaises(BlockingIOError):
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        child.kill()
+        child.communicate(timeout=5)
+        self.assertTrue(self.record()["exited"])
+        self.assertEqual(self.log_path().read_bytes(), before)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(original["process_identity"]["pid"], 0)
+        self.cli("restart", "web")
+        self.track()
+        self.wait_log(b"ready")
+        self.cli("stop", "web")
+
+    @unittest.skipUnless(os.environ.get("BGX_FAULT_BIN"), "requires fault-test binary")
+    def test_restart_holds_name_lock_through_launch_and_preserves_pending_on_crash(self):
+        import fcntl
+        self.start()
+        notice = self.base / "restart-gate"
+        child = subprocess.Popen([os.environ["BGX_FAULT_BIN"], "restart", "web"],
+                                 env=dict(self.env, BGX_TEST_POINT="before_gate", BGX_TEST_NOTIFY=str(notice)),
+                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        self.followers.append(child)
+        self.wait_test_point(child, notice)
+        self.track()
+        contender = self.spawn(["start", "web", "--", "/bin/sleep", "120"])
+        with (self.state / "locks/web.lock").open("rb") as lock:
+            self.wait_for_name_lock(contender, lock)
+        child.kill()
+        child.communicate(timeout=5)
+        out, err = contender.communicate(timeout=5)
+        self.assertEqual(contender.returncode, 1, (out, err))
+        self.assertIn(b"unknown", self.cli("info", "web").stdout)
+        self.cli("restart", "web", expect=1)
+
     def test_stop_all_preserves_records_and_logs(self):
         self.start("web")
         self.start("Web")
@@ -650,7 +809,7 @@ class BgxTest(unittest.TestCase):
             ("log", "web", "--follow=1"), ("log", "-f"), ("log", "--follow", "--tail", "1"),
             ("log", "web", "--tail", "1", "-f", "extra"),
             ("info",), ("info", "web", "extra"), ("info", "../escape"), ("info", "web", "--json"),
-            ("restart",), ("restart", "web"), ("restart", "web", "extra"), ("restart", "web", "--", "true"),
+            ("restart",), ("restart", "web", "extra"), ("restart", "web", "--", "true"),
             ("replace", "web"), ("replace", "web", "--"), ("replace", "web", "--", ""),
             ("replace", "../escape", "--", "true"), ("replace", "web", "true"),
             ("forget", "web"),
@@ -894,7 +1053,7 @@ class BgxTest(unittest.TestCase):
         self.assertIn(b"bgx start [NAME]", general)
         for args in [(), ("-h",), ("--help",)]:
             self.assertEqual(self.cli(*args).stdout, general)
-        commands = {"start": ["s"], "stop": [], "rename": [],
+        commands = {"start": ["s"], "restart": [], "stop": [], "rename": [],
                     "list": ["ls"], "info": [], "remove": ["rm"],
                     "prune": [], "log": [], "help": ["-h", "--help"], "version": ["-V", "--version"]}
         for command, aliases in commands.items():

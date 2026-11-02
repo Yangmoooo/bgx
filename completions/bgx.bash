@@ -4,7 +4,7 @@ _bgx_complete() {
   local cur=${COMP_WORDS[COMP_CWORD]} cmd=${COMP_WORDS[1]} word name rest candidate
   local i count=0 tail_value=0 has_tail=0 has_follow=0 has_force=0 has_dry_run=0
   local selected=' ' want_names=0 header=1 has_all=0
-  local subcommands='start s stop rename list ls info log remove rm prune help version -h --help -V --version'
+  local subcommands='start s restart stop rename list ls info log remove rm prune help version -h --help -V --version'
   local -a candidates
   COMPREPLY=()
   candidates=()
@@ -45,7 +45,7 @@ _bgx_complete() {
         want_names=1; candidates=(-h --help)
         ((has_force)) || candidates+=(--force)
         ;;
-      rename|info|log)
+      restart|rename|info|log)
         ((count == 0)) && want_names=1
         candidates=(-h --help)
         if [[ $cmd == log ]]; then

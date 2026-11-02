@@ -14,7 +14,7 @@
 #endif
 
 typedef enum {
-    CMD_START, CMD_STOP, CMD_RENAME, CMD_LIST, CMD_INFO, CMD_LOG,
+    CMD_START, CMD_RESTART, CMD_STOP, CMD_RENAME, CMD_LIST, CMD_INFO, CMD_LOG,
     CMD_REMOVE, CMD_PRUNE, CMD_HELP, CMD_VERSION, CMD_COUNT
 } Command;
 
@@ -31,6 +31,11 @@ static const struct {
      "the previous record and log, even if the new command fails to start.\n"
      "The command inherits the current directory and environment.\n"
      "Output is logged; terminal input is disabled.\n", {"s"}},
+    [CMD_RESTART] = {"restart", "restart NAME", "Stop a run and start its recorded command again.",
+     "Keep the name, command, and working directory; inherit the current environment.\n"
+     "Check the directory before stopping. A stop failure prevents a new launch.\n"
+     "Replace the old log when starting the new run; a launch failure does not restore it.\n"
+     "Print the name on success. Stale, unknown, and invalid records are refused.\n", {NULL}},
     [CMD_STOP] = {"stop", "stop NAME [NAME...] | stop --all", "Stop background commands and their process groups.",
      "Send TERM, wait up to 5 seconds, then KILL if needed. Keep records and logs.\n"
      "--all selects all recorded names in the current state directory; do not combine it with names.\n"
@@ -171,7 +176,7 @@ static int parse_arguments(int argc, char **argv, Arguments *out, Error *err) {
     }
     bool multiple = command == CMD_STOP || command == CMD_REMOVE;
     if (multiple) { out->names_argc = argc - 2; out->names_argv = argv + 2; }
-    bool needs_name = command == CMD_STOP || command == CMD_INFO ||
+    bool needs_name = command == CMD_RESTART || command == CMD_STOP || command == CMD_INFO ||
                       command == CMD_REMOVE || command == CMD_LOG;
     for (int i = 2; i < argc; ++i) {
         const char *arg = argv[i];
@@ -343,6 +348,16 @@ static int remove_locked(Store *s, const char *name, Record *record, Error *err)
     return store_remove(s, name, err);
 }
 
+static int restart_locked(Store *s, const char *name, Record *record, Error *err) {
+    /* This invocation performs only one restart. Change its directory before
+       stopping anything; start_locked then captures it normally. The store has
+       already resolved relative paths and opened its directory descriptors. */
+    if (chdir(record->cwd)) return syserr(err, "enter recorded working directory");
+    if (stop_locked(s, name, record, err)) return -1;
+    bgx_test_point("restart_stopped");
+    return start_locked(s, name, record, (int)record->argc, record->argv, err);
+}
+
 static int seek_tail(int fd, off_t end, uintmax_t lines, off_t *start, Error *err) {
     *start = end;
     if (!lines) return 0;
@@ -505,7 +520,10 @@ static int info_instance(const char *name, Error *err) {
 static int mutate_instance(Command command, const char *name, bool force,
                            int program_argc, char **program_argv, Error *err) {
     Store s;
-    if (store_open(&s, true, err)) return -1;
+    int opened = store_open(&s, command != CMD_RESTART, err);
+    if (opened < 0) return -1;
+    if (opened == 1) return fail(err, "instance not found: %s", name);
+    if (store_open_locks(&s, err)) { store_close(&s); return -1; }
     bool automatic = command == CMD_START && !name;
     char generated[30];
     int rc = -1, lock = -1;
@@ -535,11 +553,12 @@ static int mutate_instance(Command command, const char *name, bool force,
         if (loaded < 0) rc = -1;
         else if (command == CMD_START) rc = start_locked(&s, name, &record, program_argc, program_argv, err);
         else if (loaded == 1) fail(err, "instance not found: %s", name);
+        else if (command == CMD_RESTART) rc = restart_locked(&s, name, &record, err);
         else if (command == CMD_STOP) rc = stop_locked(&s, name, &record, err);
         else if (command == CMD_REMOVE) rc = remove_locked(&s, name, &record, err);
         record_free(&record);
     }
-    if (!rc && command == CMD_START) {
+    if (!rc && (command == CMD_START || command == CMD_RESTART)) {
         printf("%s\n", name);
         if (fflush(stdout)) {
             syserr(err, "write name");
@@ -548,7 +567,7 @@ static int mutate_instance(Command command, const char *name, bool force,
         }
     }
 done:
-    if (rc && command == CMD_START && name) {
+    if (rc && (command == CMD_START || command == CMD_RESTART) && name) {
         Error cause = *err;
         fail(err, "%s: %.370s", name, cause.text);
     }
@@ -817,7 +836,7 @@ int main(int argc, char **argv) {
         break;
     case CMD_REMOVE: return mutate_names(&args);
     case CMD_RENAME: rc = rename_instance(args.name, args.new_name, &err); break;
-    case CMD_START:
+    case CMD_START: case CMD_RESTART:
         rc = mutate_instance(args.command, args.name, args.force,
                              args.program_argc, args.program_argv, &err);
         break;

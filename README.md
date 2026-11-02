@@ -107,6 +107,7 @@ files. Neither method stops runs or removes their state directory.
 | Command | Description |
 | --- | --- |
 | `bgx start [NAME] -- PROGRAM [ARGS...]` | Start a command and print its name |
+| `bgx restart NAME` | Stop a run and start its recorded command again under the same name |
 | `bgx list` | Show names, status, PIDs, uptime, and commands |
 | `bgx info NAME` | Show task details, launch diagnostics, and log paths |
 | `bgx log NAME [--tail N] [-f]` | Print all or the last N lines; `-f`/`--follow` streams new output |
@@ -131,13 +132,31 @@ Wrappers keep their own name: `env ...` produces `env-xxxx`.
 
 An explicit name can be reused after its run has exited. **Reuse discards the
 previous record and log, even if the new command fails to start.** Running,
-stale, unknown, or unreadable records block reuse. There is no saved task
-definition, restart command, or run history.
+stale, unknown, or unreadable records block reuse. Each name retains only its
+latest run; there is no run history or automatic supervision.
 
 Every start uses the current directory and environment, disables terminal input,
 and combines stdout and stderr in one log. Success prints only the name to
 stdout. Errors go to stderr; launch errors include the name so retained records
 can be inspected. `s` is an alias for `start`.
+
+`restart NAME` reuses the recorded argv and working directory, keeping the same
+name (including automatically generated names). It inherits the environment of
+the current invocation, including `PATH`. The working directory is checked
+before stopping the old run; if stopping fails, no new process is launched.
+Already-exited runs can be restarted too.
+
+```sh
+bgx restart worker
+```
+
+The name stays locked throughout stop and start. Starting the new run discards
+the old record and log, just like explicit name reuse; failure does not revive
+the old process or restore its output. Confirmed launch failures retain the
+command and diagnostics, so they can be retried. An interrupted or uncertain
+launch remains `unknown` and blocks further restarts. Existing `log -f` viewers
+stay on the old log; open a new viewer to follow the restarted run. Success
+prints the name. `restart` accepts one name, with no `--all` option.
 
 Use `rename` to give an automatically named run a memorable name, or change an
 explicit name. Running and exited runs can be renamed. The destination must be
@@ -222,6 +241,10 @@ bgx start worker -- sh -c 'MODE=prod python3 worker.py'
 bgx records argv, but does not save a separate environment snapshot. Values
 passed through `env KEY=value` are part of argv and appear in saved metadata and
 command listings. Prefer inherited environment variables for sensitive values.
+On restart, inherited values come from the new invocation: `MODE=prod bgx start
+worker -- PROGRAM` does not save `MODE` for later. To repeat the same assignment,
+use `bgx start worker -- env MODE=prod PROGRAM`, or supply it again when calling
+`restart`.
 
 ## Behavior and limits
 
