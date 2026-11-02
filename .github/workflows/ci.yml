@@ -46,7 +46,7 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y zsh
       - name: Validate scripts and release notes
         run: |
-          bash -n scripts/zig-cc.sh scripts/release-notes.sh scripts/package.sh
+          bash -n scripts/zig-cc.sh scripts/release-notes.sh scripts/package.sh scripts/version.sh
           bash -n completions/bgx.bash
           zsh -n completions/_bgx
           if [[ $RELEASE_TAG != dev ]]; then

@@ -7,6 +7,7 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- Local builds automatically include the Git version and a dirty-worktree marker.
 - `restart NAME` reruns the recorded command in its recorded directory with the
   current environment, keeping its name and replacing its log. No failure rollback.
 - `stop --all` stops recorded runs while keeping their records and logs.

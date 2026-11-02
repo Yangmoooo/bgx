@@ -97,6 +97,12 @@ make install PREFIX="$HOME/.local"
 This installs the binary and both completion files at the paths above. Follow
 the shell configuration steps to enable completion.
 
+Local builds derive their version from Git: a clean `v0.4.0` tag becomes
+`0.4.0`, and later commits produce versions such as `0.4.0-2-g21f850e`.
+Uncommitted changes to tracked files append `-dirty`; untracked files are not
+included. Without a matching tag the version is `dev-g<commit>`, and without
+Git metadata it falls back to `dev`. Override it with `make VERSION=custom`.
+
 To uninstall a manual installation, delete the installed binary and completion
 files and remove the corresponding shell configuration. From a checkout, you
 can instead use `make uninstall PREFIX="$HOME/.local"` to delete the installed
@@ -317,7 +323,8 @@ make release TAG=vX.Y.Z
 Use `make MODE=debug test` to test a debug build.
 CI runs `make check`, builds both architectures, and verifies the packages on every
 push and pull request. It checks that the native packaged binary matches the one
-tested. Tag builds inject the release version; other builds use `dev`.
+tested. CI explicitly injects the release version for tags and `dev` for other
+builds, so local Git version detection does not affect release packages.
 After a successful tag build, CI calls the Release workflow to publish those exact
 packages. Release does not rebuild or run tests. `make release TAG=dev` can be used
 to check packaging locally without preparing release notes.

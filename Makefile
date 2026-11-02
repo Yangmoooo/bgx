@@ -1,7 +1,9 @@
 CC = bash scripts/zig-cc.sh
 SANITIZER_CC ?= clang
 PYTHON ?= python3
-VERSION ?= dev
+ifeq ($(origin VERSION),undefined)
+VERSION := $(shell bash scripts/version.sh)
+endif
 MODE ?= release
 TARGET_OS ?= $(shell uname -s | tr A-Z a-z)
 TARGET_ARCH ?= $(shell uname -m)
