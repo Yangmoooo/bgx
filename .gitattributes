@@ -1,3 +1,4 @@
 * text=auto eol=lf
-# Keep vendored upstream sources byte-for-byte, including their whitespace.
+tests/** linguist-detectable=false
+# Disable Git whitespace error checks for upstream cJSON sources.
 vendor/cjson/cJSON.[ch] -whitespace
