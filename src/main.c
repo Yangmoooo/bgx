@@ -470,6 +470,18 @@ static void info_argv(const char *label, const char *const *argv, size_t argc) {
     fputc('\n', stdout);
 }
 
+static void format_uptime(time_t started, char out[32]) {
+    time_t now = time(NULL);
+    long long seconds = now > started ? (long long)(now - started) : 0;
+    long long days = seconds / 86400;
+    long long hours = (seconds % 86400) / 3600;
+    long long minutes = (seconds % 3600) / 60;
+    if (days)
+        snprintf(out, 32, "%lldd %02lld:%02lld:%02lld", days, hours, minutes, seconds % 60);
+    else
+        snprintf(out, 32, "%02lld:%02lld:%02lld", hours, minutes, seconds % 60);
+}
+
 static int print_info(const Record *record, const char *log_path, Error *err) {
     Error observation = {0};
     Status state = task_status(record, &observation);
@@ -482,12 +494,7 @@ static int print_info(const Record *record, const char *log_path, Error *err) {
         snprintf(pid, sizeof(pid), "%ld", (long)record->identity.pid);
         snprintf(pgid, sizeof(pgid), "%ld", (long)record->identity.pgid);
     }
-    if (state == RUNNING) {
-        time_t now = time(NULL);
-        long long seconds = now > record->started ? (long long)(now - record->started) : 0;
-        snprintf(uptime, sizeof(uptime), "%02lld:%02lld:%02lld",
-                 seconds / 3600, (seconds % 3600) / 60, seconds % 60);
-    }
+    if (state == RUNNING) format_uptime(record->started, uptime);
     printf("%-14s %s\n", "Name:", record->name);
     printf("%-14s %s\n", "Status:", status_name(state));
     printf("%-14s %s\n", "Launch:", launch_state_name(record->launch));
@@ -749,7 +756,7 @@ static int list_instances(Error *err) {
     Store s;
     int opened = store_open(&s, false, err);
     if (opened < 0) return -1;
-    printf("%-24s %-9s %-8s %-9s %s\n", "NAME", "STATUS", "PID", "UPTIME", "COMMAND");
+    printf("%-24s %-9s %-8s %-14s %s\n", "NAME", "STATUS", "PID", "UPTIME", "COMMAND");
     if (opened == 1) return fflush(stdout) ? syserr(err, "write output") : 0;
     char **names = NULL;
     size_t count = 0;
@@ -761,7 +768,7 @@ static int list_instances(Error *err) {
         int loaded = store_load(&s, names[i], &task, &load_error);
         if (loaded == 1) continue; /* Concurrent preparation/removal. */
         if (loaded < 0) {
-            printf("%-24s %-9s %-8s %-9s %s\n", names[i], status_name(UNKNOWN), "-", "-", "-");
+            printf("%-24s %-9s %-8s %-14s %s\n", names[i], status_name(UNKNOWN), "-", "-", "-");
             report_error(names[i], &load_error);
             incomplete = true;
             continue;
@@ -774,12 +781,9 @@ static int list_instances(Error *err) {
         char pid[32] = "-", uptime[32] = "-";
         if (state == RUNNING && confirmed && confirmed->has_identity) {
             snprintf(pid, sizeof(pid), "%ld", (long)confirmed->identity.pid);
-            time_t now = time(NULL);
-            long long seconds = now > confirmed->started ? (long long)(now - confirmed->started) : 0;
-            snprintf(uptime, sizeof(uptime), "%02lld:%02lld:%02lld",
-                     seconds / 3600, (seconds % 3600) / 60, seconds % 60);
+            format_uptime(confirmed->started, uptime);
         }
-        printf("%-24s %-9s %-8s %-9s ", names[i], status_name(state), pid, uptime);
+        printf("%-24s %-9s %-8s %-14s ", names[i], status_name(state), pid, uptime);
         for (size_t j = 0; j < argc; ++j) {
             if (j) fputc(' ', stdout);
             print_arg(stdout, argv[j]);

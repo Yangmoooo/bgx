@@ -952,7 +952,7 @@ class BgxTest(unittest.TestCase):
                 self.assertEqual(fields["Recorded PID"], str(record["process_identity"]["pid"]))
                 self.assertEqual(fields["Recorded PGID"], str(record["process_identity"]["process_group"]))
                 self.assertEqual(fields["Started"], expected)
-                self.assertRegex(fields["Uptime"], r"^\d{2,}:\d{2}:\d{2}$")
+                self.assertRegex(fields["Uptime"], r"^(?:[1-9]\d*d )?\d{2}:\d{2}:\d{2}$")
                 self.assertEqual(fields["Directory"], json.dumps(str(self.cwd)))
                 self.assertEqual(fields["Command"], "/bin/sleep 120")
                 self.assertEqual(Path(fields["Log"]).parent, directory)
@@ -1730,26 +1730,41 @@ class BgxTest(unittest.TestCase):
                 os.kill(original["process_identity"]["pid"], 0)
                 self.cli("rm", "web", "--force")
 
-    def test_uptime_is_hours_minutes_seconds_without_day_wrap(self):
+    def test_uptime_shows_days_and_hours_minutes_seconds(self):
         original = self.start()
-        for elapsed in [0, 59, 60, 3599, 3600, 86400, 100 * 3600 + 125, -3600]:
+        for elapsed in [0, 59, 60, 3599, 3600, 86399, 86400,
+                        3 * 86400 + 4 * 3600 + 5 * 60 + 6,
+                        21 * 86400, 1000 * 86400 + 125, -3600]:
             with self.subTest(elapsed=elapsed):
                 started = int(time.time()) - elapsed
                 record = deepcopy(original)
                 record["started_at"] = datetime.fromtimestamp(started, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
                 self.save(record)
-                before = int(time.time())
-                row = self.cli("ls").stdout.decode().splitlines()[1].split()
-                after = int(time.time())
-                self.assertRegex(row[3], r"^\d{2,}:\d{2}:\d{2}$")
-                h, m, s = map(int, row[3].split(":"))
-                self.assertLess(m, 60)
-                self.assertLess(s, 60)
-                self.assertGreaterEqual(h * 3600 + m * 60 + s, max(0, before - started))
-                self.assertLessEqual(h * 3600 + m * 60 + s, max(0, after - started))
+                for command in [("ls",), ("info", "web")]:
+                    before = int(time.time())
+                    lines = self.cli(*command).stdout.decode().splitlines()
+                    after = int(time.time())
+                    if command == ("ls",):
+                        column = lines[0].index("UPTIME")
+                        end = lines[0].index("COMMAND")
+                        uptime = lines[1][column:end].strip()
+                        self.assertTrue(lines[1][end:].startswith(sys.executable))
+                    else:
+                        uptime = next(line.split(":", 1)[1].strip()
+                                      for line in lines if line.startswith("Uptime:"))
+                    self.assertRegex(uptime, r"^(?:[1-9]\d*d )?\d{2}:\d{2}:\d{2}$")
+                    days, clock = uptime.split(" ") if " " in uptime else ("0d", uptime)
+                    h, m, s = map(int, clock.split(":"))
+                    self.assertLess(h, 24)
+                    self.assertLess(m, 60)
+                    self.assertLess(s, 60)
+                    seconds = int(days[:-1]) * 86400 + h * 3600 + m * 60 + s
+                    self.assertGreaterEqual(seconds, max(0, before - started))
+                    self.assertLessEqual(seconds, max(0, after - started))
         self.save(original)
         self.cli("stop", "web")
         self.assertEqual(self.cli("ls").stdout.decode().splitlines()[1].split()[3], "-")
+        self.assertIn("Uptime:        -", self.cli("info", "web").stdout.decode())
 
     def test_force_remove_does_not_stop_target_and_reuse_is_independent(self):
         original = self.start()
