@@ -5,6 +5,8 @@ and [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.1] - 2026-11-13
+
 ### Changed
 
 - `list` and `info` show uptime of a day or longer as `3d 04:05:06`.
