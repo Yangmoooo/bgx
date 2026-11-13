@@ -272,6 +272,9 @@ use `bgx start worker -- env MODE=prod PROGRAM`, or supply it again when calling
 - `log -f` follows the opened log even after task exit or name replacement; run it
   again to view a new execution. `--tail 0 -f` shows only new output. Observed
   truncation restarts reading at the beginning; Ctrl-C stops only the viewer.
+- Logs grow without an automatic size limit. To reclaim space during a run,
+  truncate its existing log file using the path shown by `info`; new output appends.
+  Renaming or deleting the file does not redirect the running process's output.
 - `prune` deletes only tasks currently assessed as `exited`, rechecking under each
   name's lock. It preserves running, stale, unknown, and unreadable tasks; errors
   are reported without blocking other candidates and cause a nonzero exit.

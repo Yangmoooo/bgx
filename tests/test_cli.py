@@ -1327,6 +1327,21 @@ class BgxTest(unittest.TestCase):
         self.assertFalse(marker.exists())
         self.assertEqual(self.record()["launch"], "failed")
 
+    def test_log_writes_append_after_external_truncation(self):
+        gate = self.cwd / "continue"
+        self.start(code=(
+            "import os,time; from pathlib import Path\n"
+            "os.write(1,b'ready\\n')\n"
+            "while not Path('continue').exists(): time.sleep(0.01)\n"
+            "os.write(2,b'next\\n'); time.sleep(120)\n"
+        ))
+        with self.log_path().open("wb"):
+            pass
+        gate.touch()
+        self.wait_log(b"next\n")
+        self.cli("stop", "web")
+        self.assertEqual(self.cli("log", "web").stdout, b"next\n")
+
     def test_log_missing_instance_does_not_create_state_or_locks(self):
         result = self.cli("log", "missing", expect=1)
         self.assertIn(b"bgx: missing: instance not found", result.stderr)

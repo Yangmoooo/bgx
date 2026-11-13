@@ -493,7 +493,7 @@ int store_exists(Store *s, const char *name, Error *err) {
 int store_create_log(Store *s, const char *name, Error *err) {
     int dir = open_instance(s, name, true, err);
     if (dir < 0) return -1;
-    int fd = regular_file(dir, BGX_LOG_FILE, O_CREAT | O_EXCL | O_WRONLY, err);
+    int fd = regular_file(dir, BGX_LOG_FILE, O_CREAT | O_EXCL | O_WRONLY | O_APPEND, err);
     if (fd >= 0 && fchmod(fd, 0600)) {
         syserr(err, "secure log");
         close(fd);
