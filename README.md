@@ -86,8 +86,8 @@ Completion stops after `--`; the launched program's arguments are not completed.
 
 ### Build from source
 
-In a repository checkout, building requires Make and the Zig version in
-[.zig-version](.zig-version), plus Command Line Tools on macOS:
+In a repository checkout, building requires Make and a stable Zig release at
+least as new as [.zig-version](.zig-version), plus Command Line Tools on macOS:
 
 ```sh
 make
@@ -96,6 +96,10 @@ make install PREFIX="$HOME/.local"
 
 This installs the binary and both completion files at the paths above. Follow
 the shell configuration steps to enable completion.
+
+CI uses the exact version in `.zig-version`, including for release packages.
+Newer local toolchains are allowed; compiler, linker, and libc changes can still
+affect builds. Use `ZIG=/path/to/zig make` to select a toolchain.
 
 Local builds derive their version from Git: a clean `v0.4.0` tag becomes
 `0.4.0`, and later commits produce versions such as `0.4.0-2-g21f850e`.

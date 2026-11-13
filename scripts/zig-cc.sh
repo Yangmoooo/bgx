@@ -3,11 +3,27 @@ set -euo pipefail
 
 # Shared by normal and release builds; only the optimization/debug flags differ.
 zig=${ZIG:-zig}
-expected=$(cat .zig-version)
-if [[ $("$zig" version) != "$expected" ]]; then
-  echo "bgx builds require Zig $expected (see .zig-version)" >&2
+# Local minimum; CI also uses this exact version for tests and release packages.
+minimum=$(cat .zig-version)
+if ! zig_path=$(command -v "$zig"); then
+  echo "bgx builds require Zig >= $minimum (see .zig-version); executable not found: $zig" >&2
   exit 1
 fi
+if ! actual=$("$zig_path" version); then
+  echo "Cannot read Zig version at $zig_path; bgx requires Zig >= $minimum" >&2
+  exit 1
+fi
+version_error() {
+  echo "bgx builds require a stable Zig release >= $minimum (see .zig-version); found '$actual' at $zig_path" >&2
+  exit 1
+}
+[[ $actual =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || version_error
+installed=("${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}")
+IFS=. read -r -a required <<< "$minimum"
+for i in 0 1 2; do
+  ((10#${installed[i]} < 10#${required[i]})) && version_error
+  if ((10#${installed[i]} > 10#${required[i]})); then break; fi
+done
 
 target_os=${TARGET_OS:-$(uname -s | tr '[:upper:]' '[:lower:]')}
 target_arch=${TARGET_ARCH:-$(uname -m)}
